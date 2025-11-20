@@ -753,8 +753,8 @@ privileged_init( fd_topo_t *      topo,
   FD_TEST( fd_rng_secure( &ctx->seed, 8UL ) );
 
   if( tile->snapin.use_vinyl && !tile->snapin.lthash_disabled ) {
-    FD_LOG_WARNING(( "lthash verficiation for vinyl not yet implemented" ));
-    tile->snapin.lthash_disabled = 1;
+    FD_LOG_WARNING(( "lthash verficiation for vinyl is currently experimental" ));
+    tile->snapin.lthash_disabled = 0;
   }
 
   if( tile->snapin.use_vinyl ) {
