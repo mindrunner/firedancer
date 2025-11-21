@@ -196,7 +196,7 @@ handle_microblock( fd_bank_ctx_t *     ctx,
 
     fd_bank_t * bank = fd_banks_bank_query( ctx->banks, ctx->_bank_idx );
     FD_TEST( bank );
-    fd_runtime_prepare_and_execute_txn( &ctx->runtime, bank, txn_in, txn_out );
+    txn_out->err.exec_err = fd_runtime_prepare_and_execute_txn( &ctx->runtime, bank, txn_in, txn_out );
 
     /* Stash the result in the flags value so that pack can inspect it. */
     txn->flags = (txn->flags & 0x00FFFFFFU) | ((uint)(-txn_out->err.exec_err)<<24);
