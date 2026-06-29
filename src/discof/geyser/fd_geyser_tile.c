@@ -36,9 +36,10 @@
 #define GEYSER_MAX_IN_LINKS (32UL)
 #define GEYSER_FILTER_KEY_MAX (32UL)
 #define GEYSER_ENC_BUF_SZ (512UL)
-/* Account encode buffer: max inline account data (link MTU) plus the
-   protobuf framing overhead, with the fd_pb_encode slack. */
-#define GEYSER_ACCT_ENC_BUF_SZ ((ulong)USHORT_MAX + 1024UL)
+/* Account encode buffer: a fully reassembled account (up to
+   FD_GEYSER_ACCT_DATA_MAX) plus protobuf framing overhead + encoder
+   slack. */
+#define GEYSER_ACCT_ENC_BUF_SZ (FD_GEYSER_ACCT_DATA_MAX + 1024UL)
 
 /* Per-subscriber account/owner filter bounds (extra entries ignored). */
 #define GEYSER_SUB_ACCT_MAX  (16UL)
@@ -70,6 +71,16 @@ struct geyser_sub {
 
 typedef struct geyser_sub geyser_sub_t;
 
+/* Per-in-link account reassembly state (one logical account at a time
+   per link). */
+struct geyser_reasm {
+  int                  active;
+  ulong                data_off;
+  fd_geyser_acct_hdr_t hdr;
+};
+
+typedef struct geyser_reasm geyser_reasm_t;
+
 struct fd_geyser_tile {
   fd_grpc_server_t * server;
   geyser_sub_t *     subs;        /* [max_conn_cnt] */
@@ -83,7 +94,8 @@ struct fd_geyser_tile {
   ushort listen_port;
 
   /* Global monotonic write_version stamped on every account update on
-     ingest, guaranteeing per-slot ordering across all execrp producers. */
+     ingest, guaranteeing per-slot ordering across all execrp/execle
+     producers. */
   ulong write_version;
 
   int    in_kind[ GEYSER_MAX_IN_LINKS ];
@@ -94,8 +106,14 @@ struct fd_geyser_tile {
     ulong       mtu;
   } in[ GEYSER_MAX_IN_LINKS ];
 
-  uchar enc_buf[ GEYSER_ENC_BUF_SZ ];
-  uchar acct_enc_buf[ GEYSER_ACCT_ENC_BUF_SZ ];
+  /* Account reassembly: per-link state + a pool of in_cnt buffers, each
+     FD_GEYSER_ACCT_DATA_MAX bytes (buffer for link i starts at
+     reasm_pool + i*FD_GEYSER_ACCT_DATA_MAX). */
+  geyser_reasm_t reasm[ GEYSER_MAX_IN_LINKS ];
+  uchar *        reasm_pool;
+
+  uchar   enc_buf[ GEYSER_ENC_BUF_SZ ];
+  uchar * acct_enc_buf;
 };
 
 typedef struct fd_geyser_tile fd_geyser_tile_t;
@@ -110,7 +128,9 @@ derive_server_params( fd_topo_tile_t const * tile ) {
      consumer is isolated and can be evicted without affecting others). */
   ulong total_out = tile->geyser.send_buffer_size_mb*(1UL<<20UL);
   if( !total_out ) total_out = 64UL*(1UL<<20UL);
-  ulong per_conn_out = fd_ulong_max( 1UL<<16UL, total_out/max_conn );
+  /* Each connection ring must hold at least one fully reassembled
+     account message plus slack. */
+  ulong per_conn_out = fd_ulong_max( FD_GEYSER_ACCT_DATA_MAX + (1UL<<16UL), total_out/max_conn );
   return (fd_grpc_server_params_t){
     .max_conn_cnt    = max_conn,
     .conn_rx_buf_sz  = 1UL<<16UL, /* 64 KiB */
@@ -475,16 +495,41 @@ returnable_frag( fd_geyser_tile_t *  ctx,
                  ulong               sig,
                  ulong               chunk,
                  ulong               sz,
-                 ulong               ctl    FD_PARAM_UNUSED,
+                 ulong               ctl,
                  ulong               tsorig FD_PARAM_UNUSED,
                  ulong               tspub  FD_PARAM_UNUSED,
                  fd_stem_context_t * stem ) {
   (void)stem;
 
   if( ctx->in_kind[ in_idx ]==IN_KIND_ACCT ) {
-    if( FD_UNLIKELY( sz<sizeof(fd_geyser_acct_hdr_t) ) ) return 0;
-    fd_geyser_acct_hdr_t const * h = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
-    geyser_publish_account( ctx, h, (uchar const *)h + sizeof(fd_geyser_acct_hdr_t), sz - sizeof(fd_geyser_acct_hdr_t) );
+    ulong          hdr_sz = sizeof(fd_geyser_acct_hdr_t);
+    uchar const *  frag   = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
+    int            som    = fd_frag_meta_ctl_som( ctl );
+    int            eom    = fd_frag_meta_ctl_eom( ctl );
+    geyser_reasm_t * r    = &ctx->reasm[ in_idx ];
+    uchar *        buf    = ctx->reasm_pool + in_idx*FD_GEYSER_ACCT_DATA_MAX;
+
+    if( som ) {
+      r->active = 0;
+      if( FD_UNLIKELY( sz<hdr_sz ) ) return 0;
+      r->hdr = *(fd_geyser_acct_hdr_t const *)frag;
+      ulong d = sz - hdr_sz;
+      if( FD_UNLIKELY( d>FD_GEYSER_ACCT_DATA_MAX ) ) return 0;
+      fd_memcpy( buf, frag+hdr_sz, d );
+      r->data_off = d;
+      r->active   = 1;
+    } else {
+      if( FD_UNLIKELY( !r->active ) ) return 0;                                   /* lost SOM (overrun) */
+      if( FD_UNLIKELY( r->data_off+sz>FD_GEYSER_ACCT_DATA_MAX ) ) { r->active=0; return 0; }
+      fd_memcpy( buf+r->data_off, frag, sz );
+      r->data_off += sz;
+    }
+
+    if( eom && r->active ) {
+      /* Discard accounts left incomplete by an overrun (dropped fragment). */
+      if( FD_LIKELY( r->data_off==r->hdr.data_len ) ) geyser_publish_account( ctx, &r->hdr, buf, r->data_off );
+      r->active = 0;
+    }
     return 0;
   }
 
@@ -526,6 +571,8 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
   l = FD_LAYOUT_APPEND( l, alignof(fd_geyser_tile_t), sizeof(fd_geyser_tile_t)                       );
   l = FD_LAYOUT_APPEND( l, fd_grpc_server_align(),    fd_grpc_server_footprint( params )             );
   l = FD_LAYOUT_APPEND( l, alignof(geyser_sub_t),     tile->geyser.max_connections*sizeof(geyser_sub_t) );
+  l = FD_LAYOUT_APPEND( l, 16UL,                      GEYSER_ACCT_ENC_BUF_SZ                         );
+  l = FD_LAYOUT_APPEND( l, 16UL,                      tile->in_cnt*FD_GEYSER_ACCT_DATA_MAX           );
   return FD_LAYOUT_FINI( l, scratch_align() );
 }
 
@@ -536,14 +583,18 @@ privileged_init( fd_topo_t const *      topo,
   fd_grpc_server_params_t params = derive_server_params( tile );
 
   FD_SCRATCH_ALLOC_INIT( l, scratch );
-  fd_geyser_tile_t * ctx     = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_geyser_tile_t), sizeof(fd_geyser_tile_t)            );
-  void *             _server = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_server_align(),    fd_grpc_server_footprint( params )  );
-  void *             _subs   = FD_SCRATCH_ALLOC_APPEND( l, alignof(geyser_sub_t),     tile->geyser.max_connections*sizeof(geyser_sub_t) );
+  fd_geyser_tile_t * ctx       = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_geyser_tile_t), sizeof(fd_geyser_tile_t)            );
+  void *             _server    = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_server_align(),    fd_grpc_server_footprint( params )  );
+  void *             _subs      = FD_SCRATCH_ALLOC_APPEND( l, alignof(geyser_sub_t),     tile->geyser.max_connections*sizeof(geyser_sub_t) );
+  void *             _acct_enc  = FD_SCRATCH_ALLOC_APPEND( l, 16UL,                      GEYSER_ACCT_ENC_BUF_SZ              );
+  void *             _reasm     = FD_SCRATCH_ALLOC_APPEND( l, 16UL,                      tile->in_cnt*FD_GEYSER_ACCT_DATA_MAX );
 
   fd_memset( ctx,   0, sizeof(fd_geyser_tile_t) );
   fd_memset( _subs, 0, tile->geyser.max_connections*sizeof(geyser_sub_t) );
 
   ctx->subs         = _subs;
+  ctx->acct_enc_buf = _acct_enc;
+  ctx->reasm_pool   = _reasm;
   ctx->max_conn_cnt = tile->geyser.max_connections;
   ctx->listen_addr  = tile->geyser.listen_addr;
   ctx->listen_port  = tile->geyser.listen_port;
@@ -583,6 +634,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
     if     ( !strcmp( link->name, "replay_out"    ) ) ctx->in_kind[ i ] = IN_KIND_REPLAY;
     else if( !strcmp( link->name, "execrp_geyser" ) ) ctx->in_kind[ i ] = IN_KIND_ACCT;
+    else if( !strcmp( link->name, "execle_geyser" ) ) ctx->in_kind[ i ] = IN_KIND_ACCT;
     else FD_LOG_ERR(( "geyser: unexpected in-link %s", link->name ));
   }
 

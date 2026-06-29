@@ -584,6 +584,10 @@ fd_topo_initialize( config_t * config ) {
     FOR(resolv_tile_cnt)   fd_topob_link( topo, "resolv_pack",   "resolv_pack",   65536UL,                                  FD_TPU_RESOLVED_MTU,           1UL );
     /**/                   fd_topob_link( topo, "pack_poh",      "pack_poh",      4096UL,                                   sizeof(fd_done_packing_t),     1UL );
     FOR(execle_tile_cnt)   fd_topob_link( topo, "execle_poh",    "execle_poh",    16384UL,                                  USHORT_MAX,                    1UL );
+    if( FD_UNLIKELY( geyser_enabled && execle_tile_cnt ) ) {
+      fd_topob_wksp( topo, "execle_geyser" );
+      FOR(execle_tile_cnt) fd_topob_link( topo, "execle_geyser", "execle_geyser", 256UL,                                    USHORT_MAX,                    1UL );
+    }
     /* pack_execle is shared across all execle, so if one executor stalls
        due to complex transactions, the buffer needs to be large so that
        other executors can keep proceeding. */
@@ -855,6 +859,9 @@ fd_topo_initialize( config_t * config ) {
     }
     FOR(execle_tile_cnt) fd_topob_tile_in ( topo, "execle",  i,            "metric_in", "pack_execle",   0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
     FOR(execle_tile_cnt) fd_topob_tile_out( topo, "execle",  i,                         "execle_poh",    i                                                  );
+    if( FD_UNLIKELY( geyser_enabled && execle_tile_cnt ) ) {
+      FOR(execle_tile_cnt) fd_topob_tile_out( topo, "execle",  i,                       "execle_geyser", i                                                  );
+    }
     if( FD_LIKELY( config->tiles.pack.use_consumed_cus ) ) {
       FOR(execle_tile_cnt)fd_topob_tile_out(topo, "execle",  i,                         "execle_pack",   i                                                  );
     }
@@ -997,6 +1004,7 @@ fd_topo_initialize( config_t * config ) {
        backpressure consensus. */
     fd_topob_tile_in( topo, "geyser", 0UL, "metric_in", "replay_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
     FOR(execrp_tile_cnt) fd_topob_tile_in( topo, "geyser", 0UL, "metric_in", "execrp_geyser", i, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    FOR(execle_tile_cnt) fd_topob_tile_in( topo, "geyser", 0UL, "metric_in", "execle_geyser", i, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   }
 
   if( FD_UNLIKELY( solcap_enabled ) ) {

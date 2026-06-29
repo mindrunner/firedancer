@@ -11,8 +11,10 @@
 #include "../../disco/metrics/generated/fd_metrics_enums.h"
 #include "../../discof/fd_startup.h"
 #include "../../flamenco/runtime/fd_runtime.h"
+#include "../../flamenco/runtime/fd_executor.h"
 #include "../../flamenco/runtime/fd_bank.h"
 #include "../../flamenco/progcache/fd_progcache_user.h"
+#include "../geyser/fd_geyser_acct.h"
 #include "../../flamenco/log_collector/fd_log_collector_base.h"
 #include <time.h>
 #include "generated/fd_execle_tile_seccomp.h"
@@ -47,6 +49,11 @@ struct fd_execle_tile {
 
   fd_execle_out_t out_poh[1];
   fd_execle_out_t out_pack[1];
+
+  /* Optional account-update stream to the geyser tile.  idx==ULONG_MAX
+     when the geyser tile is not enabled (zero cost). */
+  fd_execle_out_t out_geyser[1];
+  ulong           geyser_mtu;
 
   ulong rebates_for_slot;
   int enable_rebates;
@@ -144,6 +151,45 @@ before_frag( fd_execle_tile_t * ctx,
   if( FD_UNLIKELY( target_execle_kind_id!=ctx->kind_id ) ) return 1;
 
   return 0;
+}
+
+/* Stream a transaction's committed account updates to the geyser tile
+   (leader path).  Mirrors fd_runtime_commit_txn's persistence set: on
+   success every acquired writable account; on a failed txn only the
+   rolled-back fee payer and nonce account. */
+
+static inline void
+execle_publish_one_geyser_account( fd_execle_tile_t *   ctx,
+                                   fd_stem_context_t *  stem,
+                                   fd_txn_out_t const * to,
+                                   ulong                acct_idx,
+                                   ulong                slot,
+                                   uchar const *        sig ) {
+  fd_acc_t const * a = to->accounts.account[ acct_idx ];
+  if( FD_UNLIKELY( !a ) ) return;
+  fd_geyser_acct_publish( stem, ctx->out_geyser->idx, ctx->out_geyser->mem, &ctx->out_geyser->chunk,
+                          ctx->out_geyser->chunk0, ctx->out_geyser->wmark, ctx->geyser_mtu,
+                          to->accounts.keys[ acct_idx ].uc, a->owner, a->lamports, a->executable,
+                          a->data, a->data_len, slot, sig, 1 );
+}
+
+static inline void
+execle_publish_geyser_accounts( fd_execle_tile_t *   ctx,
+                                fd_stem_context_t *  stem,
+                                fd_txn_out_t const * to,
+                                ulong                slot ) {
+  if( FD_LIKELY( ctx->out_geyser->idx==ULONG_MAX ) ) return; /* geyser disabled */
+  if( FD_UNLIKELY( !to->err.is_committable ) ) return;
+  uchar const * sig = to->details.signature.uc;
+  if( FD_LIKELY( !to->err.txn_err ) ) {
+    for( ushort i=0; i<to->accounts.cnt; i++ )
+      if( to->accounts.is_writable[ i ] && to->accounts.account_acquired[ i ] )
+        execle_publish_one_geyser_account( ctx, stem, to, i, slot, sig );
+  } else {
+    ulong ni = to->accounts.nonce_idx_in_txn;
+    if( ni!=ULONG_MAX )            execle_publish_one_geyser_account( ctx, stem, to, ni,                   slot, sig );
+    if( ni!=FD_FEE_PAYER_TXN_IDX ) execle_publish_one_geyser_account( ctx, stem, to, FD_FEE_PAYER_TXN_IDX, slot, sig );
+  }
 }
 
 static inline void
@@ -311,6 +357,9 @@ handle_microblock( fd_execle_tile_t *  ctx,
        would be no way to undo the partially applied changes to the bank
        in finalize anyway. */
     fd_runtime_commit_txn( ctx->runtime, bank, txn_out );
+
+    /* Stream committed account updates to the geyser tile (if enabled). */
+    execle_publish_geyser_accounts( ctx, stem, txn_out, bank->f.slot );
 
     long const txn_end_ticks = fd_tickcount();
 
@@ -509,6 +558,9 @@ handle_bundle( fd_execle_tile_t *  ctx,
       uchar *        signature = (uchar *)txn_in->txn->payload + TXN( txn_in->txn )->signature_off;
 
       fd_runtime_commit_txn( ctx->runtime, bank, txn_out );
+
+      /* Stream committed account updates to the geyser tile (if enabled). */
+      execle_publish_geyser_accounts( ctx, stem, txn_out, bank->f.slot );
 
       txn_end_ticks[ i ] = fd_tickcount();
 
@@ -772,6 +824,11 @@ unprivileged_init( fd_topo_t const *      topo,
 
   *ctx->out_poh = out1( topo, tile, "execle_poh" ); FD_TEST( ctx->out_poh->idx!=ULONG_MAX );
   *ctx->out_pack = out1( topo, tile, "execle_pack" );
+
+  *ctx->out_geyser = out1( topo, tile, "execle_geyser" );
+  ctx->geyser_mtu  = 0UL;
+  if( FD_UNLIKELY( ctx->out_geyser->idx!=ULONG_MAX ) )
+    ctx->geyser_mtu = topo->links[ tile->out_link_id[ ctx->out_geyser->idx ] ].mtu;
 
   ctx->enable_rebates = ctx->out_pack->idx!=ULONG_MAX;
 
