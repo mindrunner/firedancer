@@ -1668,6 +1668,33 @@ telemetry = true
         # loading.
         delay_startup = true
 
+    [tiles.geyser]
+        # If the Yellowstone-compatible Geyser gRPC server is enabled.
+        # When enabled, a stock Yellowstone gRPC client can connect to
+        # the listen address and open the geyser.Geyser/Subscribe stream.
+        #
+        # NOTE: This is an experimental, plaintext (no TLS / no auth)
+        # server intended for trusted local consumers.  Do not expose it
+        # to untrusted networks.
+        enabled = false
+
+        # The address to listen on.  By default, if enabled, the Geyser
+        # server will only be accessible from the local machine.
+        listen_address = "127.0.0.1"
+
+        # The TCP port to listen on for gRPC (HTTP/2) connections.
+        listen_port = 10000
+
+        # The maximum number of concurrent gRPC subscriber connections.
+        max_connections = 64
+
+        # All subscriber connections share buffer space for outgoing
+        # update messages.  If a connection's buffer runs out (a slow
+        # consumer), that connection is dropped rather than stalling the
+        # validator.  Larger values tolerate slower clients at the cost
+        # of memory usage.
+        send_buffer_size_mb = 64
+
 # These options can be useful for development, but should not be used
 # when connecting to a live cluster, as they may cause the validator to
 # be unstable or have degraded performance or security.  The program

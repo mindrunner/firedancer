@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package geyser;
+
+/* Yellowstone-compatible Geyser gRPC schema (Firedancer subset).
+
+   Field numbers and message/enum names match the reference implementation
+   rpcpool/yellowstone-grpc so that a stock Yellowstone client can connect
+   unmodified.  This file documents the wire contract that
+   src/discof/geyser/fd_geyser_tile.c encodes by hand with fd_pb_encode.h;
+   it is a reference and is NOT run through protoc by the build.
+
+   v1 (this file) implements only the slot + ping/pong path.  Account,
+   transaction, block, blocks_meta and entry updates are intentionally
+   omitted until later phases; their field numbers are reserved here so the
+   oneof tags stay compatible when they land. */
+
+service Geyser {
+  rpc Subscribe( stream SubscribeRequest ) returns ( stream SubscribeUpdate );
+}
+
+enum CommitmentLevel {
+  PROCESSED = 0;
+  CONFIRMED = 1;
+  FINALIZED = 2;
+}
+
+enum SlotStatus {
+  SLOT_PROCESSED            = 0;
+  SLOT_CONFIRMED            = 1;
+  SLOT_FINALIZED            = 2;
+  SLOT_FIRST_SHRED_RECEIVED = 3;
+  SLOT_COMPLETED            = 4;
+  SLOT_CREATED_BANK         = 5;
+  SLOT_DEAD                 = 6;
+}
+
+message SubscribeRequest {
+  map<string, SubscribeRequestFilterAccounts> accounts     = 1; /* reserved (v2) */
+  map<string, SubscribeRequestFilterSlots>    slots        = 2;
+  CommitmentLevel                             commitment   = 6;
+  SubscribeRequestPing                        ping         = 9;
+  uint64                                      from_slot    = 11;
+}
+
+message SubscribeRequestFilterAccounts {
+  repeated string account = 2; /* reserved (v2) */
+  repeated string owner   = 3; /* reserved (v2) */
+}
+
+message SubscribeRequestFilterSlots {
+  optional bool filter_by_commitment = 1;
+  optional bool interslot_updates    = 2;
+}
+
+message SubscribeRequestPing {
+  int32 id = 1;
+}
+
+message SubscribeUpdate {
+  repeated string         filters = 1;
+  /* update_oneof */
+  SubscribeUpdateAccount  account = 2; /* reserved (v2) */
+  SubscribeUpdateSlot     slot    = 3;
+  SubscribeUpdatePing     ping    = 6;
+  SubscribeUpdatePong     pong    = 9;
+}
+
+message SubscribeUpdateSlot {
+  uint64          slot       = 1;
+  optional uint64 parent     = 2;
+  SlotStatus      status     = 3;
+  optional string dead_error = 4;
+}
+
+/* Reserved for v2 (account streaming); fields documented for reference. */
+message SubscribeUpdateAccount {
+  SubscribeUpdateAccountInfo account    = 1;
+  uint64                     slot       = 2;
+  bool                       is_startup = 3;
+}
+
+message SubscribeUpdateAccountInfo {
+  bytes           pubkey        = 1;
+  uint64          lamports      = 2;
+  bytes           owner         = 3;
+  bool            executable    = 4;
+  uint64          rent_epoch    = 5;
+  bytes           data          = 6;
+  uint64          write_version = 7;
+  optional bytes  txn_signature = 8;
+}
+
+message SubscribeUpdatePing {}
+
+message SubscribeUpdatePong {
+  int32 id = 1;
+}

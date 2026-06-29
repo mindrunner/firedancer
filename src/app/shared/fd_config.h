@@ -490,6 +490,14 @@ struct fd_config {
     } rpc;
 
     struct {
+      int    enabled;
+      char   listen_address[ 16 ];
+      ushort listen_port;
+      ulong  max_connections;
+      ulong  send_buffer_size_mb;
+    } geyser;
+
+    struct {
       ushort repair_client_listen_port;
       ulong  slot_max;
     } repair;

@@ -405,6 +405,13 @@ struct fd_topo_tile {
     } rpc;
 
     struct {
+      uint   listen_addr;
+      ushort listen_port;
+      ulong  max_connections;
+      ulong  send_buffer_size_mb;
+    } geyser;
+
+    struct {
       uint   prometheus_listen_addr;
       ushort prometheus_listen_port;
     } metric;

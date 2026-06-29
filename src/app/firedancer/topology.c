@@ -405,6 +405,7 @@ fd_topo_initialize( config_t * config ) {
 
   int snapshots_enabled = !!config->gossip.entrypoints_cnt;
   int rpc_enabled       = config->tiles.rpc.enabled;
+  int geyser_enabled    = config->tiles.geyser.enabled;
   int telemetry_enabled = config->telemetry && strcmp( config->tiles.event.url, "" );
   int leader_enabled    = !!config->firedancer.layout.enable_block_production;
   int rserve_enabled    = config->tiles.rserve.enabled;
@@ -692,6 +693,11 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile( topo, "rpc", "rpc", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 1, 0 );
   }
 
+  if( FD_UNLIKELY( geyser_enabled ) ) {
+    fd_topob_wksp( topo, "geyser" );
+    fd_topob_tile( topo, "geyser", "geyser", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 0, 0 );
+  }
+
   if( FD_UNLIKELY( solcap_enabled ) ) {
     fd_topob_wksp( topo, "solcap" );
     fd_topob_tile( topo, "solcap", "solcap", "metric_in", tile_to_cpu[ topo->tile_cnt ], 0, 0, 0 );
@@ -975,6 +981,12 @@ fd_topo_initialize( config_t * config ) {
     fd_topob_tile_in( topo, "rpc",    0UL, "metric_in", "genesi_out", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     fd_topob_tile_in( topo, "replay", 0UL, "metric_in", "rpc_replay", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
     fd_topob_tile_in( topo, "rpc",    0UL, "metric_in", "gossip_out", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
+  }
+
+  if( FD_UNLIKELY( geyser_enabled ) ) {
+    /* Observability tile: consume slot events unreliably so a slow or
+       dead Geyser subscriber can never backpressure consensus. */
+    fd_topob_tile_in( topo, "geyser", 0UL, "metric_in", "replay_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   }
 
   if( FD_UNLIKELY( solcap_enabled ) ) {
@@ -1688,6 +1700,14 @@ fd_topo_configure_tile( fd_topo_tile_t * tile,
     FD_TEST( tile->rpc.accdb_epoch_fseq_obj_id!=ULONG_MAX );
 
     fd_cstr_ncpy( tile->rpc.identity_key_path, config->paths.identity_key, sizeof(tile->rpc.identity_key_path) );
+
+  } else if( FD_UNLIKELY( !strcmp( tile->name, "geyser" ) ) ) {
+
+    if( FD_UNLIKELY( !fd_cstr_to_ip4_addr( config->tiles.geyser.listen_address, &tile->geyser.listen_addr ) ) )
+      FD_LOG_ERR(( "failed to parse geyser listen address `%s`", config->tiles.geyser.listen_address ));
+    tile->geyser.listen_port         = config->tiles.geyser.listen_port;
+    tile->geyser.max_connections     = config->tiles.geyser.max_connections;
+    tile->geyser.send_buffer_size_mb = config->tiles.geyser.send_buffer_size_mb;
 
   } else if( FD_UNLIKELY( !strcmp( tile->name, "backt" ) ) ) {
 
