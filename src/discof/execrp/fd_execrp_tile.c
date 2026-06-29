@@ -10,6 +10,7 @@
 #include "../../flamenco/runtime/fd_runtime.h"
 #include "../../flamenco/runtime/fd_executor.h"
 #include "../../flamenco/runtime/tests/fd_dump_pb.h"
+#include "../geyser/fd_geyser_acct.h"
 #include "../../flamenco/progcache/fd_progcache_user.h"
 #include "../../flamenco/log_collector/fd_log_collector_base.h"
 #include "../../disco/metrics/fd_metrics.h"
@@ -39,6 +40,11 @@ struct fd_execrp_tile {
   /* link-related data structures. */
   link_ctx_t            replay_in[ 1 ];
   link_ctx_t            execrp_replay_out[ 1 ]; /* TODO: Remove with solcap v2 */
+
+  /* Optional account-update stream to the geyser tile.  idx==ULONG_MAX
+     when the geyser tile is not enabled (zero cost). */
+  link_ctx_t            geyser_out[ 1 ];
+  ulong                 geyser_mtu;
 
   fd_sha512_t           sha_mem[ FD_TXN_ACTUAL_SIG_MAX ];
   fd_sha512_t *         sha_lj[ FD_TXN_ACTUAL_SIG_MAX ];
@@ -189,6 +195,44 @@ publish_txn_finalized_msg( fd_execrp_tile_t *  ctx,
   ctx->execrp_replay_out->chunk = fd_dcache_compact_next( ctx->execrp_replay_out->chunk, sizeof(*msg), ctx->execrp_replay_out->chunk0, ctx->execrp_replay_out->wmark );
 }
 
+static inline void
+execrp_publish_one_geyser_account( fd_execrp_tile_t *  ctx,
+                                   fd_stem_context_t * stem,
+                                   ulong               acct_idx,
+                                   ulong               slot,
+                                   uchar const *       sig ) {
+  fd_acc_t const * a = ctx->txn_out.accounts.account[ acct_idx ];
+  if( FD_UNLIKELY( !a ) ) return;
+  fd_geyser_acct_publish( stem, ctx->geyser_out->idx, ctx->geyser_out->mem, &ctx->geyser_out->chunk,
+                          ctx->geyser_out->chunk0, ctx->geyser_out->wmark, ctx->geyser_mtu,
+                          ctx->txn_out.accounts.keys[ acct_idx ].uc, a->owner, a->lamports, a->executable,
+                          a->data, a->data_len, slot, sig, 1 );
+}
+
+static inline void
+execrp_publish_geyser_accounts( fd_execrp_tile_t *  ctx,
+                                fd_stem_context_t * stem ) {
+  if( FD_LIKELY( ctx->geyser_out->idx==ULONG_MAX ) ) return; /* geyser disabled */
+  fd_txn_out_t * to = &ctx->txn_out;
+  if( FD_UNLIKELY( !to->err.is_committable ) ) return;       /* canceled: nothing persisted */
+
+  ulong         slot = ctx->bank->f.slot;
+  uchar const * sig  = to->details.signature.uc;
+
+  if( FD_LIKELY( !to->err.txn_err ) ) {
+    for( ushort i=0; i<to->accounts.cnt; i++ ) {
+      if( !to->accounts.is_writable[ i ] || !to->accounts.account_acquired[ i ] ) continue;
+      execrp_publish_one_geyser_account( ctx, stem, i, slot, sig );
+    }
+  } else {
+    /* Failed txn: commit only rolled back the fee payer and (if any) the
+       nonce account. */
+    ulong ni = to->accounts.nonce_idx_in_txn;
+    if( ni!=ULONG_MAX )            execrp_publish_one_geyser_account( ctx, stem, ni,                   slot, sig );
+    if( ni!=FD_FEE_PAYER_TXN_IDX ) execrp_publish_one_geyser_account( ctx, stem, FD_FEE_PAYER_TXN_IDX, slot, sig );
+  }
+}
+
 static inline int
 returnable_frag( fd_execrp_tile_t *  ctx,
                  ulong               in_idx,
@@ -239,6 +283,12 @@ returnable_frag( fd_execrp_tile_t *  ctx,
         ctx->dispatch_time_comp = tspub;
         ctx->slot = ctx->bank->f.slot;
         publish_txn_finalized_msg( ctx, stem );
+
+        /* Stream committed account updates to the geyser tile (if
+           enabled).  Mirrors fd_runtime_commit_txn's persistence set:
+           on success every acquired writable account; on failure only
+           the rolled-back fee payer and nonce account. */
+        execrp_publish_geyser_accounts( ctx, stem );
 
         /* Update metrics */
         ulong load_start_ticks_dt  = fd_ulong_if( ctx->txn_out.details.check_start_ticks==LONG_MAX  || ctx->txn_out.details.load_start_ticks==LONG_MAX,   0UL, (ulong)( ctx->txn_out.details.check_start_ticks  - ctx->txn_out.details.load_start_ticks ) );
@@ -363,6 +413,17 @@ unprivileged_init( fd_topo_t const *      topo,
     ctx->execrp_replay_out->chunk  = ctx->execrp_replay_out->chunk0;
   }
 
+  /* Optional account-update stream to the geyser tile. */
+  ctx->geyser_out->idx = fd_topo_find_tile_out_link( topo, tile, "execrp_geyser", ctx->tile_idx );
+  ctx->geyser_mtu      = 0UL;
+  if( FD_UNLIKELY( ctx->geyser_out->idx!=ULONG_MAX ) ) {
+    fd_topo_link_t const * geyser_link = &topo->links[ tile->out_link_id[ ctx->geyser_out->idx ] ];
+    ctx->geyser_out->mem    = topo->workspaces[ topo->objs[ geyser_link->dcache_obj_id ].wksp_id ].wksp;
+    ctx->geyser_out->chunk0 = fd_dcache_compact_chunk0( ctx->geyser_out->mem, geyser_link->dcache );
+    ctx->geyser_out->wmark  = fd_dcache_compact_wmark( ctx->geyser_out->mem, geyser_link->dcache, geyser_link->mtu );
+    ctx->geyser_out->chunk  = ctx->geyser_out->chunk0;
+    ctx->geyser_mtu         = geyser_link->mtu;
+  }
 
   ctx->capture_ctx = NULL;
   if( FD_UNLIKELY( strlen( tile->execrp.solcap_capture ) ) ) {

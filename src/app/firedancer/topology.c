@@ -616,6 +616,11 @@ fd_topo_initialize( config_t * config ) {
 
   FOR(execrp_tile_cnt) fd_topob_link( topo, "execrp_replay", "execrp_replay", 16384UL,                                  sizeof(fd_execrp_task_done_msg_t), 1UL );
 
+  if( FD_UNLIKELY( geyser_enabled && execrp_tile_cnt ) ) {
+    fd_topob_wksp( topo, "execrp_geyser" );
+    FOR(execrp_tile_cnt) fd_topob_link( topo, "execrp_geyser", "execrp_geyser", 256UL,                                    USHORT_MAX,                       1UL );
+  }
+
   ushort parsed_tile_to_cpu[ FD_TILE_MAX ];
   /* Unassigned tiles will be floating, unless auto topology is enabled. */
   for( ulong i=0UL; i<FD_TILE_MAX; i++ ) parsed_tile_to_cpu[ i ] = USHORT_MAX;
@@ -807,6 +812,9 @@ fd_topo_initialize( config_t * config ) {
 
   FOR(execrp_tile_cnt) fd_topob_tile_in (   topo, "execrp",  i,            "metric_in", "replay_execrp", 0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
   FOR(execrp_tile_cnt) fd_topob_tile_out(   topo, "execrp",  i,                         "execrp_replay", i                                                  );
+  if( FD_UNLIKELY( geyser_enabled && execrp_tile_cnt ) ) {
+    FOR(execrp_tile_cnt) fd_topob_tile_out( topo, "execrp",  i,                         "execrp_geyser", i                                                  );
+  }
 
   if(leader_enabled)  {fd_topob_tile_in (   topo, "tower",   0UL,          "metric_in", "dedup_resolv",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );}
   /**/                 fd_topob_tile_in (   topo, "tower",   0UL,          "metric_in", "replay_epoch",  0UL,          FD_TOPOB_RELIABLE,   FD_TOPOB_POLLED );
@@ -984,9 +992,11 @@ fd_topo_initialize( config_t * config ) {
   }
 
   if( FD_UNLIKELY( geyser_enabled ) ) {
-    /* Observability tile: consume slot events unreliably so a slow or
-       dead Geyser subscriber can never backpressure consensus. */
+    /* Observability tile: consume slot events and account updates
+       unreliably so a slow or dead Geyser subscriber can never
+       backpressure consensus. */
     fd_topob_tile_in( topo, "geyser", 0UL, "metric_in", "replay_out", 0UL, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
+    FOR(execrp_tile_cnt) fd_topob_tile_in( topo, "geyser", 0UL, "metric_in", "execrp_geyser", i, FD_TOPOB_UNRELIABLE, FD_TOPOB_POLLED );
   }
 
   if( FD_UNLIKELY( solcap_enabled ) ) {
