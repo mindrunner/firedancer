@@ -1,0 +1,56 @@
+# logfile_fd:      The tile writes log messages to a log file.
+#
+# geyser_socket_fd: The geyser tile serves Yellowstone gRPC over HTTP/2,
+#                   which is over TCP and does not use our XDP program.
+#                   It uses regular kernel sockets, so this is the listen
+#                   socket file descriptor.
+uint logfile_fd, uint geyser_socket_fd
+
+# logging: all log messages are written to a file and/or pipe
+#
+# arg 0 is the file descriptor to write to.  The boot process ensures
+# that descriptor 2 is always STDERR and descriptor 4 is the logfile.
+write: (or (eq (arg 0) 2)
+           (eq (arg 0) logfile_fd))
+
+# logging: 'WARNING' and above fsync the logfile to disk immediately
+#
+# arg 0 is the file descriptor to fsync.
+fsync: (eq (arg 0) logfile_fd)
+
+# server: serving gRPC requires accepting connections
+#
+# arg 0 is the listen socket file descriptor to accept connections on
+accept4: (and (eq (arg 0) geyser_socket_fd)
+              (eq (arg 1) 0)
+              (eq (arg 2) 0)
+              (eq (arg 3) "SOCK_CLOEXEC|SOCK_NONBLOCK"))
+
+# server: serving gRPC requires reading from connections
+#
+# arg 0 is the file descriptor to read from.  It can be any of the
+# connected client sockets returned by accept4(2).  To accomodate this,
+# we allow any file descriptor except those which we know are not these
+# connected clients, which are the log file, STDERR, and the listening
+# socket itself.
+recvmsg: (and (not (or (eq (arg 0) 2)
+                       (eq (arg 0) logfile_fd)
+                       (eq (arg 0) geyser_socket_fd)))
+              (eq (arg 2) "MSG_NOSIGNAL"))
+
+# server: serving gRPC requires writing to connections
+#
+# arg 0 is the file descriptor to send to.  It can be any of the
+# connected client sockets returned by accept4(2).
+sendmsg: (and (not (or (eq (arg 0) 2)
+                       (eq (arg 0) logfile_fd)
+                       (eq (arg 0) geyser_socket_fd)))
+              (eq (arg 2) "MSG_NOSIGNAL"))
+
+# server: serving gRPC requires closing connections
+#
+# arg 0 is the file descriptor to close.  It can be any of the connected
+# client sockets returned by accept4(2).
+close: (not (or (eq (arg 0) 2)
+                (eq (arg 0) logfile_fd)
+                (eq (arg 0) geyser_socket_fd)))
