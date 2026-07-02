@@ -16,7 +16,12 @@
    fd_h2_conn_init_server advertises (16384). */
 #define FD_GRPC_SERVER_SCRATCH_SZ (16384UL)
 
-#define FD_GRPC_SUBSCRIBE_PATH "/geyser.Geyser/Subscribe"
+#define FD_GRPC_SUBSCRIBE_PATH  "/geyser.Geyser/Subscribe"
+#define FD_GRPC_GETVERSION_PATH "/geyser.Geyser/GetVersion"
+
+/* GetVersionResponse.version string (Yellowstone convention is a JSON
+   blob; clients read it as an opaque string). */
+#define FD_GRPC_SERVER_VERSION "{\"version\":\"0.1.0\",\"package\":\"firedancer-geyser\",\"proto\":\"1.0.0\"}"
 
 /* Per-connection state. */
 
@@ -37,6 +42,7 @@ struct fd_grpc_server_conn {
   uint  resp_pending;    /* response HEADERS owed to peer           */
   uint  resp_hdrs_sent;  /* response HEADERS already emitted        */
   uint  reject;          /* path not handled -> send UNIMPLEMENTED  */
+  uint  is_getversion;   /* unary GetVersion -> canned reply        */
   uint  tx_active;       /* tx_op currently draining an out span    */
   ulong tx_span;         /* bytes handed to the in-flight tx_op     */
 
@@ -99,6 +105,7 @@ fd_grpc_server_app_stream_close( fd_grpc_server_conn_t * c ) {
   c->resp_pending   = 0U;
   c->resp_hdrs_sent = 0U;
   c->reject         = 0U;
+  c->is_getversion  = 0U;
   c->tx_active      = 0U;
   c->req_sz         = 0UL;
 }
@@ -140,10 +147,13 @@ fd_grpc_server_cb_headers( fd_h2_conn_t *   conn,
   }
 
   if( flags & FD_H2_FLAG_END_HEADERS ) {
-    int path_ok = ( c->path_len==(sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL) &&
-                    fd_memeq( c->path, FD_GRPC_SUBSCRIBE_PATH, sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL ) );
-    c->reject       = !path_ok;
-    c->resp_pending = 1U; /* emitted from poll, after SETTINGS */
+    int is_sub = ( c->path_len==(sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL) &&
+                   fd_memeq( c->path, FD_GRPC_SUBSCRIBE_PATH, sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL ) );
+    int is_ver = ( c->path_len==(sizeof(FD_GRPC_GETVERSION_PATH)-1UL) &&
+                   fd_memeq( c->path, FD_GRPC_GETVERSION_PATH, sizeof(FD_GRPC_GETVERSION_PATH)-1UL ) );
+    c->is_getversion = (uint)is_ver;
+    c->reject        = (uint)( !is_sub && !is_ver );
+    c->resp_pending  = 1U; /* emitted from poll, after SETTINGS */
   }
 }
 
@@ -156,7 +166,7 @@ fd_grpc_server_cb_data( fd_h2_conn_t *   conn,
   (void)stream; (void)flags;
   fd_grpc_server_conn_t * c      = conn->ctx;
   fd_grpc_server_t *      server = c->server;
-  if( FD_UNLIKELY( c->reject ) ) return;
+  if( FD_UNLIKELY( c->reject || c->is_getversion ) ) return; /* GetVersion request body is ignored */
 
   /* Append to request reassembly buffer (bounded). */
   ulong cap = server->params.max_request_sz;
@@ -348,6 +358,41 @@ fd_grpc_server_send_unimplemented( fd_grpc_server_conn_t * c ) {
             (uint)(FD_H2_FLAG_END_HEADERS|FD_H2_FLAG_END_STREAM), c->stream_id );
 }
 
+/* Emit a complete unary GetVersion response: HEADERS + one DATA message
+   (GetVersionResponse) + grpc-status:0 trailers.  Caller ensures rbuf_tx
+   has space. */
+
+static void
+fd_grpc_server_send_getversion( fd_grpc_server_conn_t * c ) {
+  static uchar const resp_hdrs[] = {
+    0x88,
+    0x5f, 0x16, 'a','p','p','l','i','c','a','t','i','o','n','/','g','r','p','c','+','p','r','o','t','o'
+  };
+  fd_h2_tx( c->rbuf_tx, resp_hdrs, sizeof(resp_hdrs), FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS, c->stream_id );
+
+  /* GetVersionResponse { string version = 1 }, gRPC length-prefixed. */
+  static char const ver[]  = FD_GRPC_SERVER_VERSION;
+  ulong             verlen = sizeof(ver)-1UL; /* < 128 */
+  uchar msg[ 5 + 2 + sizeof(ver) ];
+  ulong pb = 0UL;
+  msg[ 5+pb++ ] = 0x0a;             /* field 1, wire type 2 (LEN) */
+  msg[ 5+pb++ ] = (uchar)verlen;    /* single-byte varint length */
+  fd_memcpy( msg+5+pb, ver, verlen ); pb += verlen;
+  msg[0] = 0;                       /* uncompressed */
+  msg[1] = (uchar)( pb>>24 );
+  msg[2] = (uchar)( pb>>16 );
+  msg[3] = (uchar)( pb>> 8 );
+  msg[4] = (uchar)( pb     );
+  fd_h2_tx( c->rbuf_tx, msg, 5UL+pb, FD_H2_FRAME_TYPE_DATA, 0U, c->stream_id );
+
+  /* trailers: grpc-status: 0, END_STREAM */
+  static uchar const trailers[] = {
+    0x00, 0x0b, 'g','r','p','c','-','s','t','a','t','u','s', 0x01, '0'
+  };
+  fd_h2_tx( c->rbuf_tx, trailers, sizeof(trailers), FD_H2_FRAME_TYPE_HEADERS,
+            (uint)(FD_H2_FLAG_END_HEADERS|FD_H2_FLAG_END_STREAM), c->stream_id );
+}
+
 /* Drain queued outbound gRPC messages into the HTTP/2 stream, honoring
    flow control. */
 
@@ -407,9 +452,14 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   fd_h2_tx_control( c->conn, c->rbuf_tx, &fd_grpc_server_h2_cb );
 
   /* 4. Emit deferred response headers (after SETTINGS). */
-  if( c->resp_pending && fd_h2_rbuf_free_sz( c->rbuf_tx )>=128UL ) {
+  if( c->resp_pending && fd_h2_rbuf_free_sz( c->rbuf_tx )>=256UL ) {
     if( c->reject ) {
       fd_grpc_server_send_unimplemented( c );
+      c->resp_pending = 0U;
+      fd_h2_stream_close_tx( c->stream, c->conn );
+      fd_grpc_server_app_stream_close( c );
+    } else if( c->is_getversion ) {
+      fd_grpc_server_send_getversion( c );
       c->resp_pending = 0U;
       fd_h2_stream_close_tx( c->stream, c->conn );
       fd_grpc_server_app_stream_close( c );
