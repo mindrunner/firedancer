@@ -376,7 +376,11 @@ fd_grpc_server_accept( fd_grpc_server_t * server ) {
     for( ulong i=0UL; i<server->params.max_conn_cnt; i++ ) {
       if( !server->conns[ i ].used ) { c = &server->conns[ i ]; break; }
     }
-    if( FD_UNLIKELY( !c ) ) { close( s ); continue; } /* at capacity */
+    if( FD_UNLIKELY( !c ) ) { /* at capacity */
+      FD_LOG_WARNING(( "geyser: dropping new connection, at capacity (%lu conns)", server->params.max_conn_cnt ));
+      close( s );
+      continue;
+    }
 
     fd_grpc_server_conn_reset( c );
     c->sock        = s;
@@ -545,11 +549,17 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   /* 6. Flush the transmit buffer (best-effort, non-blocking). */
   if( fd_h2_rbuf_used_sz( c->rbuf_tx ) ) {
     int tx_err = fd_h2_rbuf_sendmsg( c->rbuf_tx, c->sock, MSG_NOSIGNAL );
-    if( FD_UNLIKELY( tx_err && tx_err!=EAGAIN ) ) { fd_grpc_server_close( server, c->conn_id ); return 1; }
+    if( FD_UNLIKELY( tx_err && tx_err!=EAGAIN ) ) {
+      FD_LOG_WARNING(( "geyser: conn %lu sendmsg failed (%i-%s)", c->conn_id, tx_err, fd_io_strerror( tx_err ) ));
+      fd_grpc_server_close( server, c->conn_id );
+      return 1;
+    }
     busy = 1;
   }
 
   if( FD_UNLIKELY( c->conn->flags & FD_H2_CONN_FLAGS_DEAD ) ) {
+    FD_LOG_WARNING(( "geyser: conn %lu h2 GOAWAY (err=%u-%s) [tx path]", c->conn_id,
+                     (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
     fd_grpc_server_close( server, c->conn_id );
     return 1;
   }
@@ -562,6 +572,8 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   }
 
   if( FD_UNLIKELY( c->conn->flags & FD_H2_CONN_FLAGS_DEAD ) ) {
+    FD_LOG_WARNING(( "geyser: conn %lu h2 GOAWAY (err=%u-%s) [rx path]", c->conn_id,
+                     (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
     fd_grpc_server_close( server, c->conn_id );
     return 1;
   }
