@@ -25,6 +25,33 @@
 
 /* Per-connection state. */
 
+/* Max concurrent HTTP/2 streams per connection.  Proxies such as Envoy
+   multiplex many client requests (unary GetVersion probes + a Subscribe)
+   onto one pooled upstream connection, so the server must accept several
+   streams at once rather than one. */
+#define FD_GRPC_SERVER_MAX_STREAMS (16U)
+
+/* Stream kinds. */
+#define FD_GRPC_SK_NONE       (0U)
+#define FD_GRPC_SK_SUBSCRIBE  (1U)
+#define FD_GRPC_SK_GETVERSION (2U)
+#define FD_GRPC_SK_REJECT     (3U)
+
+/* Per-stream state.  h2 MUST be the first member so a fd_h2_stream_t*
+   from a callback can be cast back to the enclosing struct. */
+struct fd_grpc_server_stream {
+  fd_h2_stream_t h2[1];
+  uint  used;
+  uint  id;
+  uint  kind;           /* FD_GRPC_SK_*                            */
+  uint  resp_pending;   /* response owed to peer                   */
+  uint  resp_hdrs_sent; /* streaming response HEADERS emitted      */
+  char  path[ 64 ];
+  ulong path_len;
+};
+
+typedef struct fd_grpc_server_stream fd_grpc_server_stream_t;
+
 struct fd_grpc_server_conn {
   int   sock;          /* TCP socket, -1 if slot free                */
   uint  used;          /* 1 if slot in use                           */
@@ -34,34 +61,34 @@ struct fd_grpc_server_conn {
   ulong              conn_id;
 
   fd_h2_conn_t   conn[1];
-  fd_h2_stream_t stream[1];
-  fd_h2_tx_op_t  tx_op[1];
+  fd_grpc_server_stream_t streams[ FD_GRPC_SERVER_MAX_STREAMS ];
 
-  uint  stream_id;       /* active stream id, 0 if none             */
-  uint  stream_busy;     /* 1 if the single stream slot is taken    */
-  uint  resp_pending;    /* response HEADERS owed to peer           */
-  uint  resp_hdrs_sent;  /* response HEADERS already emitted        */
-  uint  reject;          /* path not handled -> send UNIMPLEMENTED  */
-  uint  is_getversion;   /* unary GetVersion -> canned reply        */
+  fd_h2_tx_op_t  tx_op[1];
   uint  tx_active;       /* tx_op currently draining an out span    */
   ulong tx_span;         /* bytes handed to the in-flight tx_op     */
 
-  ulong req_sz;          /* bytes accumulated in req_buf            */
+  /* The single long-lived Subscribe stream owns the out ring and the
+     request reassembly buffer.  <0 when there is no active subscription. */
+  long  sub_slot;
+  ulong req_sz;          /* bytes accumulated in req_buf (subscribe) */
 
   fd_h2_rbuf_t rbuf_rx[1];
   fd_h2_rbuf_t rbuf_tx[1];
-  fd_h2_rbuf_t out[1];   /* outbound framed gRPC messages           */
+  fd_h2_rbuf_t out[1];   /* outbound framed gRPC messages (subscribe) */
 
   uchar * rx_buf;
   uchar * tx_buf;
   uchar * out_buf;
   uchar * req_buf;
-
-  char  path[ 64 ];
-  ulong path_len;
 };
 
 typedef struct fd_grpc_server_conn fd_grpc_server_conn_t;
+
+/* Recover the enclosing per-stream struct from a fd_h2_stream_t*. */
+static inline fd_grpc_server_stream_t *
+fd_grpc_server_stream_of( fd_h2_stream_t * h2 ) {
+  return (fd_grpc_server_stream_t *)h2; /* h2 is the first member */
+}
 
 struct fd_grpc_server {
   fd_grpc_server_params_t            params;
@@ -79,35 +106,52 @@ struct fd_grpc_server {
 static fd_h2_stream_t *
 fd_grpc_server_cb_stream_create( fd_h2_conn_t * conn,
                                  uint           stream_id ) {
-  (void)stream_id;
   fd_grpc_server_conn_t * c = conn->ctx;
-  if( FD_UNLIKELY( c->stream_busy ) ) return NULL; /* one stream per conn */
-  fd_h2_stream_init( c->stream );
-  c->stream_busy = 1U;
-  return c->stream;
+  for( uint i=0U; i<FD_GRPC_SERVER_MAX_STREAMS; i++ ) {
+    fd_grpc_server_stream_t * s = &c->streams[ i ];
+    if( !s->used ) {
+      fd_h2_stream_init( s->h2 );
+      s->used          = 1U;
+      s->id            = stream_id;
+      s->kind          = FD_GRPC_SK_NONE;
+      s->resp_pending  = 0U;
+      s->resp_hdrs_sent= 0U;
+      s->path_len      = 0UL;
+      return s->h2;
+    }
+  }
+  return NULL; /* at capacity -> REFUSED_STREAM */
 }
 
 static fd_h2_stream_t *
 fd_grpc_server_cb_stream_query( fd_h2_conn_t * conn,
                                 uint           stream_id ) {
   fd_grpc_server_conn_t * c = conn->ctx;
-  if( FD_LIKELY( c->stream_busy && c->stream->stream_id==stream_id ) ) return c->stream;
+  for( uint i=0U; i<FD_GRPC_SERVER_MAX_STREAMS; i++ ) {
+    fd_grpc_server_stream_t * s = &c->streams[ i ];
+    if( s->used && s->id==stream_id ) return s->h2;
+  }
   return NULL;
 }
 
+/* Free a per-stream slot.  If it was the connection's Subscribe stream,
+   tear down the subscription (upcall + reset the out ring). */
 static void
-fd_grpc_server_app_stream_close( fd_grpc_server_conn_t * c ) {
-  if( FD_UNLIKELY( !c->stream_busy ) ) return;
-  fd_grpc_server_t * server = c->server;
-  if( server->cb->stream_close ) server->cb->stream_close( server->cb_ctx, c->conn_id );
-  c->stream_busy    = 0U;
-  c->stream_id      = 0U;
-  c->resp_pending   = 0U;
-  c->resp_hdrs_sent = 0U;
-  c->reject         = 0U;
-  c->is_getversion  = 0U;
-  c->tx_active      = 0U;
-  c->req_sz         = 0UL;
+fd_grpc_server_stream_free( fd_grpc_server_conn_t *   c,
+                            fd_grpc_server_stream_t * s ) {
+  if( FD_UNLIKELY( !s->used ) ) return;
+  if( (long)( s - c->streams )==c->sub_slot ) {
+    fd_grpc_server_t * server = c->server;
+    if( server->cb->stream_close ) server->cb->stream_close( server->cb_ctx, c->conn_id );
+    c->sub_slot  = -1L;
+    c->req_sz    = 0UL;
+    c->tx_active = 0U;
+    fd_h2_rbuf_init( c->out, c->out_buf, server->params.conn_out_buf_sz );
+  }
+  s->used           = 0U;
+  s->kind           = FD_GRPC_SK_NONE;
+  s->resp_pending   = 0U;
+  s->resp_hdrs_sent = 0U;
 }
 
 static void
@@ -115,9 +159,9 @@ fd_grpc_server_cb_rst_stream( fd_h2_conn_t *   conn,
                               fd_h2_stream_t * stream,
                               uint             error_code,
                               int              closed_by ) {
-  (void)stream; (void)error_code; (void)closed_by;
+  (void)error_code; (void)closed_by;
   fd_grpc_server_conn_t * c = conn->ctx;
-  fd_grpc_server_app_stream_close( c );
+  fd_grpc_server_stream_free( c, fd_grpc_server_stream_of( stream ) );
 }
 
 static void
@@ -126,11 +170,11 @@ fd_grpc_server_cb_headers( fd_h2_conn_t *   conn,
                            void const *     data,
                            ulong            data_sz,
                            ulong            flags ) {
-  fd_grpc_server_conn_t * c = conn->ctx;
-  c->stream_id = stream->stream_id;
+  fd_grpc_server_conn_t *   c = conn->ctx;
+  fd_grpc_server_stream_t * s = fd_grpc_server_stream_of( stream );
 
-  /* Decode HPACK header block and capture :path.  Phase 1 assumes the
-     header block fits in a single HEADERS frame (END_HEADERS set). */
+  /* Decode HPACK header block and capture :path.  Assumes the header
+     block fits in a single HEADERS frame (END_HEADERS set). */
   fd_hpack_rd_t hpack_rd[1];
   fd_hpack_rd_init( hpack_rd, data, data_sz );
   while( !fd_hpack_rd_done( hpack_rd ) ) {
@@ -140,20 +184,28 @@ fd_grpc_server_cb_headers( fd_h2_conn_t *   conn,
     uint err = fd_hpack_rd_next( hpack_rd, hdr, &scratch, scratch_buf+sizeof(scratch_buf) );
     if( FD_UNLIKELY( err ) ) { fd_h2_conn_error( conn, err ); return; }
     if( hdr->name_len==5UL && fd_memeq( hdr->name, ":path", 5UL ) ) {
-      c->path_len = fd_ulong_min( hdr->value_len, sizeof(c->path)-1UL );
-      fd_memcpy( c->path, hdr->value, c->path_len );
-      c->path[ c->path_len ] = '\0';
+      s->path_len = fd_ulong_min( hdr->value_len, sizeof(s->path)-1UL );
+      fd_memcpy( s->path, hdr->value, s->path_len );
+      s->path[ s->path_len ] = '\0';
     }
   }
 
   if( flags & FD_H2_FLAG_END_HEADERS ) {
-    int is_sub = ( c->path_len==(sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL) &&
-                   fd_memeq( c->path, FD_GRPC_SUBSCRIBE_PATH, sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL ) );
-    int is_ver = ( c->path_len==(sizeof(FD_GRPC_GETVERSION_PATH)-1UL) &&
-                   fd_memeq( c->path, FD_GRPC_GETVERSION_PATH, sizeof(FD_GRPC_GETVERSION_PATH)-1UL ) );
-    c->is_getversion = (uint)is_ver;
-    c->reject        = (uint)( !is_sub && !is_ver );
-    c->resp_pending  = 1U; /* emitted from poll, after SETTINGS */
+    int is_sub = ( s->path_len==(sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL) &&
+                   fd_memeq( s->path, FD_GRPC_SUBSCRIBE_PATH, sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL ) );
+    int is_ver = ( s->path_len==(sizeof(FD_GRPC_GETVERSION_PATH)-1UL) &&
+                   fd_memeq( s->path, FD_GRPC_GETVERSION_PATH, sizeof(FD_GRPC_GETVERSION_PATH)-1UL ) );
+    if( is_sub ) {
+      s->kind        = FD_GRPC_SK_SUBSCRIBE;
+      c->sub_slot    = (long)( s - c->streams );
+      c->req_sz      = 0UL;
+      s->resp_pending= 1U; /* respond with HEADERS now; keep stream open */
+    } else {
+      s->kind = is_ver ? FD_GRPC_SK_GETVERSION : FD_GRPC_SK_REJECT;
+      /* Unary: respond only once the client has finished sending, so we
+         never free the stream while more request frames are inbound. */
+      if( flags & FD_H2_FLAG_END_STREAM ) s->resp_pending = 1U;
+    }
   }
 }
 
@@ -163,12 +215,17 @@ fd_grpc_server_cb_data( fd_h2_conn_t *   conn,
                         void const *     data,
                         ulong            data_sz,
                         ulong            flags ) {
-  (void)stream; (void)flags;
-  fd_grpc_server_conn_t * c      = conn->ctx;
-  fd_grpc_server_t *      server = c->server;
-  if( FD_UNLIKELY( c->reject || c->is_getversion ) ) return; /* GetVersion request body is ignored */
+  fd_grpc_server_conn_t *   c      = conn->ctx;
+  fd_grpc_server_t *        server = c->server;
+  fd_grpc_server_stream_t * s      = fd_grpc_server_stream_of( stream );
 
-  /* Append to request reassembly buffer (bounded). */
+  if( s->kind!=FD_GRPC_SK_SUBSCRIBE ) {
+    /* Unary request body is ignored; respond once fully received. */
+    if( flags & FD_H2_FLAG_END_STREAM ) s->resp_pending = 1U;
+    return;
+  }
+
+  /* Subscribe: accumulate into the per-conn request buffer. */
   ulong cap = server->params.max_request_sz;
   if( FD_UNLIKELY( c->req_sz + data_sz > cap ) ) {
     fd_h2_conn_error( conn, FD_H2_ERR_FLOW_CONTROL );
@@ -177,7 +234,6 @@ fd_grpc_server_cb_data( fd_h2_conn_t *   conn,
   fd_memcpy( c->req_buf + c->req_sz, data, data_sz );
   c->req_sz += data_sz;
 
-  /* Extract any complete gRPC length-prefixed messages. */
   for(;;) {
     if( c->req_sz < 5UL ) break;
     uchar const * h = c->req_buf;
@@ -185,7 +241,7 @@ fd_grpc_server_cb_data( fd_h2_conn_t *   conn,
     if( FD_UNLIKELY( 5UL+msg_sz > cap ) ) { fd_h2_conn_error( conn, FD_H2_ERR_FLOW_CONTROL ); return; }
     if( c->req_sz < 5UL+msg_sz ) break;
     if( server->cb->request_msg ) {
-      server->cb->request_msg( server->cb_ctx, c->conn_id, c->path, c->path_len, c->req_buf+5UL, msg_sz );
+      server->cb->request_msg( server->cb_ctx, c->conn_id, s->path, s->path_len, c->req_buf+5UL, msg_sz );
     }
     ulong consumed = 5UL+msg_sz;
     ulong rem = c->req_sz - consumed;
@@ -283,13 +339,14 @@ fd_grpc_server_conn_reset( fd_grpc_server_conn_t * c ) {
   uchar * req_buf = c->req_buf;
 
   fd_memset( c, 0, sizeof(fd_grpc_server_conn_t) );
-  c->sock    = -1;
-  c->server  = server;
-  c->conn_id = conn_id;
-  c->rx_buf  = rx_buf;
-  c->tx_buf  = tx_buf;
-  c->out_buf = out_buf;
-  c->req_buf = req_buf;
+  c->sock     = -1;
+  c->server   = server;
+  c->conn_id  = conn_id;
+  c->sub_slot = -1L;
+  c->rx_buf   = rx_buf;
+  c->tx_buf   = tx_buf;
+  c->out_buf  = out_buf;
+  c->req_buf  = req_buf;
 }
 
 void
@@ -298,7 +355,7 @@ fd_grpc_server_close( fd_grpc_server_t * server,
   if( FD_UNLIKELY( conn_id>=server->params.max_conn_cnt ) ) return;
   fd_grpc_server_conn_t * c = &server->conns[ conn_id ];
   if( FD_UNLIKELY( !c->used ) ) return;
-  fd_grpc_server_app_stream_close( c );
+  if( c->sub_slot>=0L && server->cb->stream_close ) server->cb->stream_close( server->cb_ctx, c->conn_id );
   if( c->sock>=0 ) close( c->sock );
   fd_grpc_server_conn_reset( c );
 }
@@ -336,18 +393,20 @@ fd_grpc_server_accept( fd_grpc_server_t * server ) {
 /* Outbound response headers --------------------------------------------*/
 
 static void
-fd_grpc_server_send_resp_hdrs( fd_grpc_server_conn_t * c ) {
+fd_grpc_server_send_resp_hdrs( fd_grpc_server_conn_t * c,
+                               uint                    stream_id ) {
   /* :status: 200  -> 0x88 (static index 8)
      content-type: application/grpc+proto -> literal w/ indexed name 31 */
   static uchar const hpack[] = {
     0x88,
     0x5f, 0x16, 'a','p','p','l','i','c','a','t','i','o','n','/','g','r','p','c','+','p','r','o','t','o'
   };
-  fd_h2_tx( c->rbuf_tx, hpack, sizeof(hpack), FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS, c->stream_id );
+  fd_h2_tx( c->rbuf_tx, hpack, sizeof(hpack), FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS, stream_id );
 }
 
 static void
-fd_grpc_server_send_unimplemented( fd_grpc_server_conn_t * c ) {
+fd_grpc_server_send_unimplemented( fd_grpc_server_conn_t * c,
+                                   uint                    stream_id ) {
   /* Trailers-only response: :status 200, content-type, grpc-status: 12. */
   static uchar const hpack[] = {
     0x88,
@@ -355,7 +414,7 @@ fd_grpc_server_send_unimplemented( fd_grpc_server_conn_t * c ) {
     0x00, 0x0b, 'g','r','p','c','-','s','t','a','t','u','s', 0x02, '1','2'
   };
   fd_h2_tx( c->rbuf_tx, hpack, sizeof(hpack), FD_H2_FRAME_TYPE_HEADERS,
-            (uint)(FD_H2_FLAG_END_HEADERS|FD_H2_FLAG_END_STREAM), c->stream_id );
+            (uint)(FD_H2_FLAG_END_HEADERS|FD_H2_FLAG_END_STREAM), stream_id );
 }
 
 /* Emit a complete unary GetVersion response: HEADERS + one DATA message
@@ -363,12 +422,13 @@ fd_grpc_server_send_unimplemented( fd_grpc_server_conn_t * c ) {
    has space. */
 
 static void
-fd_grpc_server_send_getversion( fd_grpc_server_conn_t * c ) {
+fd_grpc_server_send_getversion( fd_grpc_server_conn_t * c,
+                                uint                    stream_id ) {
   static uchar const resp_hdrs[] = {
     0x88,
     0x5f, 0x16, 'a','p','p','l','i','c','a','t','i','o','n','/','g','r','p','c','+','p','r','o','t','o'
   };
-  fd_h2_tx( c->rbuf_tx, resp_hdrs, sizeof(resp_hdrs), FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS, c->stream_id );
+  fd_h2_tx( c->rbuf_tx, resp_hdrs, sizeof(resp_hdrs), FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS, stream_id );
 
   /* GetVersionResponse { string version = 1 }, gRPC length-prefixed. */
   static char const ver[]  = FD_GRPC_SERVER_VERSION;
@@ -383,22 +443,24 @@ fd_grpc_server_send_getversion( fd_grpc_server_conn_t * c ) {
   msg[2] = (uchar)( pb>>16 );
   msg[3] = (uchar)( pb>> 8 );
   msg[4] = (uchar)( pb     );
-  fd_h2_tx( c->rbuf_tx, msg, 5UL+pb, FD_H2_FRAME_TYPE_DATA, 0U, c->stream_id );
+  fd_h2_tx( c->rbuf_tx, msg, 5UL+pb, FD_H2_FRAME_TYPE_DATA, 0U, stream_id );
 
   /* trailers: grpc-status: 0, END_STREAM */
   static uchar const trailers[] = {
     0x00, 0x0b, 'g','r','p','c','-','s','t','a','t','u','s', 0x01, '0'
   };
   fd_h2_tx( c->rbuf_tx, trailers, sizeof(trailers), FD_H2_FRAME_TYPE_HEADERS,
-            (uint)(FD_H2_FLAG_END_HEADERS|FD_H2_FLAG_END_STREAM), c->stream_id );
+            (uint)(FD_H2_FLAG_END_HEADERS|FD_H2_FLAG_END_STREAM), stream_id );
 }
 
-/* Drain queued outbound gRPC messages into the HTTP/2 stream, honoring
+/* Drain queued outbound gRPC messages into the Subscribe stream, honoring
    flow control. */
 
 static void
 fd_grpc_server_flush_out( fd_grpc_server_conn_t * c ) {
-  if( FD_UNLIKELY( !c->stream_busy || !c->resp_hdrs_sent ) ) return;
+  if( FD_UNLIKELY( c->sub_slot<0L ) ) return;
+  fd_grpc_server_stream_t * s = &c->streams[ c->sub_slot ];
+  if( FD_UNLIKELY( !s->used || !s->resp_hdrs_sent ) ) return;
 
   for( int iter=0; iter<8; iter++ ) {
     if( !c->tx_active ) {
@@ -409,7 +471,7 @@ fd_grpc_server_flush_out( fd_grpc_server_conn_t * c ) {
       c->tx_active = 1U;
       c->tx_span   = sz;
     }
-    fd_h2_tx_op_copy( c->conn, c->stream, c->rbuf_tx, c->tx_op );
+    fd_h2_tx_op_copy( c->conn, s->h2, c->rbuf_tx, c->tx_op );
     if( c->tx_op->chunk_sz==0UL ) {
       fd_h2_rbuf_skip( c->out, c->tx_span );
       c->tx_active = 0U;
@@ -443,7 +505,7 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
     }
     fd_h2_conn_init_server( c->conn );
     c->conn->ctx = c;
-    c->conn->self_settings.max_concurrent_streams = 1U;
+    c->conn->self_settings.max_concurrent_streams = FD_GRPC_SERVER_MAX_STREAMS;
     c->got_preface = 1U;
   }
 
@@ -451,22 +513,29 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
         plus any ACKs/WINDOW_UPDATEs queued by the previous rx). */
   fd_h2_tx_control( c->conn, c->rbuf_tx, &fd_grpc_server_h2_cb );
 
-  /* 4. Emit deferred response headers (after SETTINGS). */
-  if( c->resp_pending && fd_h2_rbuf_free_sz( c->rbuf_tx )>=256UL ) {
-    if( c->reject ) {
-      fd_grpc_server_send_unimplemented( c );
-      c->resp_pending = 0U;
-      fd_h2_stream_close_tx( c->stream, c->conn );
-      fd_grpc_server_app_stream_close( c );
-    } else if( c->is_getversion ) {
-      fd_grpc_server_send_getversion( c );
-      c->resp_pending = 0U;
-      fd_h2_stream_close_tx( c->stream, c->conn );
-      fd_grpc_server_app_stream_close( c );
-    } else {
-      fd_grpc_server_send_resp_hdrs( c );
-      c->resp_pending   = 0U;
-      c->resp_hdrs_sent = 1U;
+  /* 4. Emit deferred responses (after SETTINGS).  Unary responses are
+        complete + fully close/free the stream (the client already sent
+        END_STREAM, so no late frames can hit the freed slot).  Subscribe
+        sends HEADERS and stays open. */
+  for( uint i=0U; i<FD_GRPC_SERVER_MAX_STREAMS; i++ ) {
+    fd_grpc_server_stream_t * s = &c->streams[ i ];
+    if( !s->used || !s->resp_pending ) continue;
+    if( fd_h2_rbuf_free_sz( c->rbuf_tx )<512UL ) break; /* retry next pass */
+
+    if( s->kind==FD_GRPC_SK_REJECT ) {
+      fd_grpc_server_send_unimplemented( c, s->id );
+      s->resp_pending = 0U;
+      fd_h2_stream_reset( s->h2, c->conn );
+      fd_grpc_server_stream_free( c, s );
+    } else if( s->kind==FD_GRPC_SK_GETVERSION ) {
+      fd_grpc_server_send_getversion( c, s->id );
+      s->resp_pending = 0U;
+      fd_h2_stream_reset( s->h2, c->conn );
+      fd_grpc_server_stream_free( c, s );
+    } else { /* subscribe */
+      fd_grpc_server_send_resp_hdrs( c, s->id );
+      s->resp_pending   = 0U;
+      s->resp_hdrs_sent = 1U;
     }
   }
 
@@ -551,7 +620,9 @@ fd_grpc_server_has_stream( fd_grpc_server_t const * server,
                            ulong                    conn_id ) {
   if( FD_UNLIKELY( conn_id>=server->params.max_conn_cnt ) ) return 0;
   fd_grpc_server_conn_t const * c = &server->conns[ conn_id ];
-  return c->used && c->stream_busy && c->resp_hdrs_sent && !c->reject;
+  if( !c->used || c->sub_slot<0L ) return 0;
+  fd_grpc_server_stream_t const * s = &c->streams[ c->sub_slot ];
+  return s->used && s->resp_hdrs_sent;
 }
 
 int
