@@ -17,6 +17,13 @@ package geyser;
 
 service Geyser {
   rpc Subscribe( stream SubscribeRequest ) returns ( stream SubscribeUpdate );
+  rpc GetVersion( GetVersionRequest ) returns ( GetVersionResponse );
+}
+
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  string version = 1; /* opaque string (Yellowstone convention: a JSON blob) */
 }
 
 enum CommitmentLevel {
