@@ -334,24 +334,27 @@ geyser_encode_account_update( uchar *              out,
   fd_pb_encoder_t enc[1];
   fd_pb_encoder_init( enc, out, out_sz );
 
+  /* Bail (return 0 -> caller skips) rather than risk an unbalanced
+     submessage close crashing the tile if the buffer is ever too small. */
+
   /* SubscribeUpdate.filters = 1 (repeated string) */
   if( filter_key_len ) fd_pb_push_string( enc, 1U, filter_key, filter_key_len );
 
   /* SubscribeUpdate.account = 2 (SubscribeUpdateAccount) */
-  fd_pb_submsg_open( enc, 2U );
+  if( FD_UNLIKELY( !fd_pb_submsg_open( enc, 2U ) ) ) return 0;
     /* SubscribeUpdateAccount.account = 1 (SubscribeUpdateAccountInfo) */
-    fd_pb_submsg_open( enc, 1U );
+    if( FD_UNLIKELY( !fd_pb_submsg_open( enc, 1U ) ) ) return 0;
       fd_pb_push_bytes ( enc, 1U, h->pubkey, 32UL );
       fd_pb_push_uint64( enc, 2U, h->lamports );
       fd_pb_push_bytes ( enc, 3U, h->owner, 32UL );
       fd_pb_push_bool  ( enc, 4U, (int)h->executable );
       fd_pb_push_uint64( enc, 5U, ULONG_MAX );          /* rent_epoch sentinel */
-      if( data_len ) fd_pb_push_bytes( enc, 6U, data, data_len );
+      if( data_len && FD_UNLIKELY( !fd_pb_push_bytes( enc, 6U, data, data_len ) ) ) return 0;
       fd_pb_push_uint64( enc, 7U, write_version );
       if( h->flags & FD_GEYSER_ACCT_FLAG_HAS_SIG ) fd_pb_push_bytes( enc, 8U, h->txn_signature, 64UL );
-    fd_pb_submsg_close( enc );
+    if( FD_UNLIKELY( !fd_pb_submsg_close( enc ) ) ) return 0;
     fd_pb_push_uint64( enc, 2U, h->slot );              /* slot */
-  fd_pb_submsg_close( enc );
+  if( FD_UNLIKELY( !fd_pb_submsg_close( enc ) ) ) return 0;
 
   return fd_pb_encoder_out_sz( enc );
 }
@@ -380,9 +383,10 @@ geyser_publish_account( fd_geyser_tile_t *           ctx,
     if( !geyser_acct_match( sub, h->pubkey, h->owner ) ) continue;
     if( !fd_grpc_server_has_stream( ctx->server, conn_id ) ) continue;
 
-    ulong sz = geyser_encode_account_update( ctx->acct_enc_buf, sizeof(ctx->acct_enc_buf),
+    ulong sz = geyser_encode_account_update( ctx->acct_enc_buf, GEYSER_ACCT_ENC_BUF_SZ,
                                              h, data, data_len, write_version,
                                              sub->acct_filter_key, sub->acct_filter_key_len );
+    if( FD_UNLIKELY( !sz ) ) continue; /* encode failed; skip this update */
     if( FD_UNLIKELY( !fd_grpc_server_publish( ctx->server, conn_id, ctx->acct_enc_buf, sz ) ) ) {
       fd_grpc_server_close( ctx->server, conn_id );
     }
