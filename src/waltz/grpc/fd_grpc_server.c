@@ -58,6 +58,7 @@ struct fd_grpc_server_conn {
   ulong              conn_id;
 
   fd_h2_conn_t   conn[1];
+  fd_hpack_dt_t  hpack_dt[1]; /* peer's HPACK dynamic table (decode side) */
   fd_grpc_server_stream_t streams[ FD_GRPC_SERVER_MAX_STREAMS ];
 
   fd_h2_tx_op_t  tx_op[1];
@@ -171,9 +172,11 @@ fd_grpc_server_cb_headers( fd_h2_conn_t *   conn,
   fd_grpc_server_stream_t * s = fd_grpc_server_stream_of( stream );
 
   /* Decode HPACK header block and capture :path.  Assumes the header
-     block fits in a single HEADERS frame (END_HEADERS set). */
+     block fits in a single HEADERS frame (END_HEADERS set).  Uses the
+     connection's dynamic table: peers may index headers before they
+     have processed our SETTINGS_HEADER_TABLE_SIZE=0. */
   fd_hpack_rd_t hpack_rd[1];
-  fd_hpack_rd_init( hpack_rd, data, data_sz );
+  fd_hpack_rd_init_dt( hpack_rd, data, data_sz, c->hpack_dt );
   while( !fd_hpack_rd_done( hpack_rd ) ) {
     uchar scratch_buf[ 1024 ];
     uchar * scratch = scratch_buf;
@@ -411,6 +414,7 @@ fd_grpc_server_accept( fd_grpc_server_t * server ) {
     c->sock        = s;
     c->used        = 1U;
     c->got_preface = 0U;
+    fd_hpack_dt_init( c->hpack_dt );
     fd_h2_rbuf_init( c->rbuf_rx, c->rx_buf,  server->params.conn_rx_buf_sz  );
     fd_h2_rbuf_init( c->rbuf_tx, c->tx_buf,  server->params.conn_tx_buf_sz  );
     fd_h2_rbuf_init( c->out,     c->out_buf, server->params.conn_out_buf_sz );
@@ -585,8 +589,10 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   }
 
   if( FD_UNLIKELY( c->conn->flags & FD_H2_CONN_FLAGS_DEAD ) ) {
-    FD_LOG_WARNING(( "grpc_server: conn %lu h2 GOAWAY (err=%u-%s) [tx path]", c->conn_id,
-                     (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
+    if( FD_UNLIKELY( c->conn->conn_error ) ) {
+      FD_LOG_WARNING(( "grpc_server: conn %lu h2 GOAWAY (err=%u-%s) [tx path]", c->conn_id,
+                       (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
+    }
     fd_grpc_server_close( server, c->conn_id );
     return 1;
   }
@@ -599,8 +605,10 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   }
 
   if( FD_UNLIKELY( c->conn->flags & FD_H2_CONN_FLAGS_DEAD ) ) {
-    FD_LOG_WARNING(( "grpc_server: conn %lu h2 GOAWAY (err=%u-%s) [rx path]", c->conn_id,
-                     (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
+    if( FD_UNLIKELY( c->conn->conn_error ) ) {
+      FD_LOG_WARNING(( "grpc_server: conn %lu h2 GOAWAY (err=%u-%s) [rx path]", c->conn_id,
+                       (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
+    }
     fd_grpc_server_close( server, c->conn_id );
     return 1;
   }
