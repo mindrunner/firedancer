@@ -46,9 +46,13 @@
 #define GEYSER_SUB_OWNER_MAX ( 8UL)
 
 /* Yellowstone SlotStatus enum values. */
-#define GEYSER_SLOT_PROCESSED (0)
-#define GEYSER_SLOT_CONFIRMED (1)
-#define GEYSER_SLOT_FINALIZED (2)
+#define GEYSER_SLOT_PROCESSED   (0)
+#define GEYSER_SLOT_CONFIRMED   (1)
+#define GEYSER_SLOT_FINALIZED   (2)
+#define GEYSER_SLOT_FIRST_SHRED (3)
+#define GEYSER_SLOT_COMPLETED   (4)
+#define GEYSER_SLOT_CREATED_BANK (5)
+#define GEYSER_SLOT_DEAD        (6)
 
 /* Max named entries in the SubscribeRequest.accounts map. */
 #define GEYSER_SUB_FILTER_MAX (4UL)
@@ -72,6 +76,8 @@ typedef struct geyser_acct_filter geyser_acct_filter_t;
 
 struct geyser_sub {
   int   wants_slots;
+  int   slot_interslot; /* SubscribeRequestFilterSlots.interslot_updates:
+                           also deliver FIRST_SHRED/COMPLETED/CREATED_BANK */
   uint  commitment;
 
   char  slot_filter_key[ GEYSER_FILTER_KEY_MAX ];
@@ -204,31 +210,6 @@ geyser_pb_skip( uchar const * p,
   }
 }
 
-/* Capture a map entry's key (field 1, string) into (key,*key_len). */
-static void
-geyser_parse_map_key( uchar const * entry,
-                      ulong         entry_sz,
-                      char *        key,
-                      ulong *       key_len ) {
-  ulong pos = 0UL;
-  while( pos<entry_sz ) {
-    ulong tag;
-    if( !geyser_pb_read_varint( entry, entry_sz, &pos, &tag ) ) return;
-    uint field = (uint)( tag>>3 );
-    uint wt    = (uint)( tag & 7U );
-    if( field==1U && wt==2U ) {
-      ulong len;
-      if( !geyser_pb_read_varint( entry, entry_sz, &pos, &len ) ) return;
-      if( pos+len>entry_sz ) return;
-      ulong cpy = fd_ulong_min( len, GEYSER_FILTER_KEY_MAX-1UL );
-      fd_memcpy( key, entry+pos, cpy );
-      *key_len = cpy;
-      return;
-    } else {
-      if( !geyser_pb_skip( entry, entry_sz, &pos, wt ) ) return;
-    }
-  }
-}
 
 /* base58-decode a (non NUL-terminated) pubkey string into out[32]. */
 static int
@@ -319,6 +300,52 @@ geyser_parse_accounts_entry( uchar const *  entry,
   }
 }
 
+/* Parse a slots map entry: field 1 = key, field 2 =
+   SubscribeRequestFilterSlots{ filter_by_commitment=1,
+   interslot_updates=2 }. */
+static void
+geyser_parse_slots_entry( uchar const *  entry,
+                          ulong          entry_sz,
+                          geyser_sub_t * sub ) {
+  ulong pos = 0UL;
+  while( pos<entry_sz ) {
+    ulong tag;
+    if( !geyser_pb_read_varint( entry, entry_sz, &pos, &tag ) ) return;
+    uint field = (uint)( tag>>3 );
+    uint wt    = (uint)( tag & 7U );
+    if( field==1U && wt==2U ) {        /* key */
+      ulong len;
+      if( !geyser_pb_read_varint( entry, entry_sz, &pos, &len ) ) return;
+      if( pos+len>entry_sz ) return;
+      if( !sub->slot_filter_key_len ) {
+        sub->slot_filter_key_len = fd_ulong_min( len, GEYSER_FILTER_KEY_MAX-1UL );
+        fd_memcpy( sub->slot_filter_key, entry+pos, sub->slot_filter_key_len );
+      }
+      pos += len;
+    } else if( field==2U && wt==2U ) { /* SubscribeRequestFilterSlots */
+      ulong len;
+      if( !geyser_pb_read_varint( entry, entry_sz, &pos, &len ) ) return;
+      if( pos+len>entry_sz ) return;
+      ulong vpos = pos;
+      ulong vend = pos+len;
+      while( vpos<vend ) {
+        ulong vtag;
+        if( !geyser_pb_read_varint( entry, vend, &vpos, &vtag ) ) break;
+        if( (uint)( vtag>>3 )==2U && (uint)( vtag & 7U )==0U ) {
+          ulong v;
+          if( !geyser_pb_read_varint( entry, vend, &vpos, &v ) ) break;
+          sub->slot_interslot = (int)( v!=0UL );
+        } else {
+          if( !geyser_pb_skip( entry, vend, &vpos, (uint)( vtag & 7U ) ) ) break;
+        }
+      }
+      pos = vend;
+    } else {
+      if( !geyser_pb_skip( entry, entry_sz, &pos, wt ) ) return;
+    }
+  }
+}
+
 /* Parse a SubscribeRequestPing (field 1 = int32 id). */
 static void
 geyser_parse_ping( uchar const *  v,
@@ -363,7 +390,7 @@ geyser_parse_subscribe_request( uchar const *  msg,
       if( !geyser_pb_read_varint( msg, msg_sz, &pos, &len ) ) return;
       if( pos+len>msg_sz ) return;
       sub->wants_slots = 1;
-      if( !sub->slot_filter_key_len ) geyser_parse_map_key( msg+pos, len, sub->slot_filter_key, &sub->slot_filter_key_len );
+      geyser_parse_slots_entry( msg+pos, len, sub );
       pos += len;
     } else if( field==6U && wt==0U ) {       /* commitment */
       ulong c;
@@ -382,6 +409,16 @@ geyser_parse_subscribe_request( uchar const *  msg,
 }
 
 /* Account update encoding + matching. */
+
+/* Append SubscribeUpdate.created_at = 11 (google.protobuf.Timestamp). */
+static void
+geyser_encode_created_at( fd_pb_encoder_t * enc,
+                          long              now_ns ) {
+  if( FD_UNLIKELY( !fd_pb_submsg_open( enc, 11U ) ) ) return;
+  fd_pb_push_int64( enc, 1U, now_ns/(long)1e9 );
+  fd_pb_push_int32( enc, 2U, (int)( now_ns%(long)1e9 ) );
+  fd_pb_submsg_close( enc );
+}
 
 static ulong
 geyser_encode_account_update( uchar *              out,
@@ -419,6 +456,8 @@ geyser_encode_account_update( uchar *              out,
     if( FD_UNLIKELY( !fd_pb_submsg_close( enc ) ) ) return 0;
     fd_pb_push_uint64( enc, 2U, h->slot );              /* slot */
   if( FD_UNLIKELY( !fd_pb_submsg_close( enc ) ) ) return 0;
+
+  geyser_encode_created_at( enc, fd_log_wallclock() );
 
   return fd_pb_encoder_out_sz( enc );
 }
@@ -485,6 +524,7 @@ geyser_encode_slot_update( uchar *       out,
                            ulong         parent,
                            int           has_parent,
                            int           status,
+                           long          now_ns,
                            char const *  filter_key,
                            ulong         filter_key_len ) {
   fd_pb_encoder_t enc[1];
@@ -500,22 +540,31 @@ geyser_encode_slot_update( uchar *       out,
     fd_pb_push_int32 ( enc, 3U, status );           /* status */
   fd_pb_submsg_close( enc );
 
+  geyser_encode_created_at( enc, now_ns );
+
   return fd_pb_encoder_out_sz( enc );
 }
 
+/* geyser_publish_slot broadcasts one slot status to slot subscribers.
+   Statuses beyond processed/confirmed/finalized/dead (i.e. FIRST_SHRED/
+   COMPLETED/CREATED_BANK) go only to subscribers that requested
+   interslot_updates, matching Yellowstone semantics. */
 static void
 geyser_publish_slot( fd_geyser_tile_t * ctx,
                      ulong              slot,
                      ulong              parent,
                      int                has_parent,
-                     int                status ) {
+                     int                status,
+                     int                interslot ) {
+  long now_ns = fd_log_wallclock();
   for( ulong conn_id=0UL; conn_id<ctx->max_conn_cnt; conn_id++ ) {
     geyser_sub_t * sub = &ctx->subs[ conn_id ];
     if( !sub->wants_slots ) continue;
+    if( interslot && !sub->slot_interslot ) continue;
     if( !fd_grpc_server_has_stream( ctx->server, conn_id ) ) continue;
 
     ulong sz = geyser_encode_slot_update( ctx->enc_buf, sizeof(ctx->enc_buf),
-                                          slot, parent, has_parent, status,
+                                          slot, parent, has_parent, status, now_ns,
                                           sub->slot_filter_key, sub->slot_filter_key_len );
     if( FD_UNLIKELY( !fd_grpc_server_publish( ctx->server, conn_id, ctx->enc_buf, sz ) ) ) {
       /* Slow consumer: evict rather than stall the validator. */
@@ -662,17 +711,34 @@ returnable_frag( fd_geyser_tile_t *  ctx,
   switch( sig ) {
     case REPLAY_SIG_SLOT_COMPLETED: {
       fd_replay_slot_completed_t const * m = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
-      geyser_publish_slot( ctx, m->slot, m->parent_slot, 1, GEYSER_SLOT_PROCESSED );
+      /* Interslot statuses (FIRST_SHRED_RECEIVED / COMPLETED /
+         CREATED_BANK) are emitted retroactively here: replay only
+         reports them (as timestamps) once the slot finishes replaying,
+         so their client-side arrival times bunch together with
+         PROCESSED.  Consumers relying on the status *sequence* (e.g.
+         yellowstone-thorofare's completeness check) work; per-status
+         arrival-latency comparisons for these three read as
+         processed-time.  Real-time emission needs a shred/repair-path
+         link, a later enhancement. */
+      geyser_publish_slot( ctx, m->slot, m->parent_slot, 1, GEYSER_SLOT_FIRST_SHRED,  1 );
+      geyser_publish_slot( ctx, m->slot, m->parent_slot, 1, GEYSER_SLOT_COMPLETED,    1 );
+      geyser_publish_slot( ctx, m->slot, m->parent_slot, 1, GEYSER_SLOT_CREATED_BANK, 1 );
+      geyser_publish_slot( ctx, m->slot, m->parent_slot, 1, GEYSER_SLOT_PROCESSED,    0 );
+      break;
+    }
+    case REPLAY_SIG_SLOT_DEAD: {
+      fd_replay_slot_dead_t const * m = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
+      geyser_publish_slot( ctx, m->slot, 0UL, 0, GEYSER_SLOT_DEAD, 0 );
       break;
     }
     case REPLAY_SIG_OC_ADVANCED: {
       fd_replay_oc_advanced_t const * m = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
-      geyser_publish_slot( ctx, m->slot, 0UL, 0, GEYSER_SLOT_CONFIRMED );
+      geyser_publish_slot( ctx, m->slot, 0UL, 0, GEYSER_SLOT_CONFIRMED, 0 );
       break;
     }
     case REPLAY_SIG_ROOT_ADVANCED: {
       fd_replay_root_advanced_t const * m = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
-      geyser_publish_slot( ctx, m->slot, 0UL, 0, GEYSER_SLOT_FINALIZED );
+      geyser_publish_slot( ctx, m->slot, 0UL, 0, GEYSER_SLOT_FINALIZED, 0 );
       break;
     }
     default:
