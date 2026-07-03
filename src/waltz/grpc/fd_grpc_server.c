@@ -16,12 +16,9 @@
    fd_h2_conn_init_server advertises (16384). */
 #define FD_GRPC_SERVER_SCRATCH_SZ (16384UL)
 
-#define FD_GRPC_SUBSCRIBE_PATH  "/geyser.Geyser/Subscribe"
-#define FD_GRPC_GETVERSION_PATH "/geyser.Geyser/GetVersion"
-
-/* GetVersionResponse.version string (Yellowstone convention is a JSON
-   blob; clients read it as an opaque string). */
-#define FD_GRPC_SERVER_VERSION "{\"version\":\"0.1.0\",\"package\":\"firedancer-geyser\",\"proto\":\"1.0.0\"}"
+/* Cap on params.version_resp so the unary version response (headers +
+   framed message + trailers) always fits comfortably in one tx pass. */
+#define FD_GRPC_SERVER_VERSION_MAX (120UL)
 
 /* Per-connection state. */
 
@@ -111,12 +108,12 @@ fd_grpc_server_cb_stream_create( fd_h2_conn_t * conn,
     fd_grpc_server_stream_t * s = &c->streams[ i ];
     if( !s->used ) {
       fd_h2_stream_init( s->h2 );
-      s->used          = 1U;
-      s->id            = stream_id;
-      s->kind          = FD_GRPC_SK_NONE;
-      s->resp_pending  = 0U;
-      s->resp_hdrs_sent= 0U;
-      s->path_len      = 0UL;
+      s->used           = 1U;
+      s->id             = stream_id;
+      s->kind           = FD_GRPC_SK_NONE;
+      s->resp_pending   = 0U;
+      s->resp_hdrs_sent = 0U;
+      s->path_len       = 0UL;
       return s->h2;
     }
   }
@@ -191,10 +188,13 @@ fd_grpc_server_cb_headers( fd_h2_conn_t *   conn,
   }
 
   if( flags & FD_H2_FLAG_END_HEADERS ) {
-    int is_sub = ( s->path_len==(sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL) &&
-                   fd_memeq( s->path, FD_GRPC_SUBSCRIBE_PATH, sizeof(FD_GRPC_SUBSCRIBE_PATH)-1UL ) );
-    int is_ver = ( s->path_len==(sizeof(FD_GRPC_GETVERSION_PATH)-1UL) &&
-                   fd_memeq( s->path, FD_GRPC_GETVERSION_PATH, sizeof(FD_GRPC_GETVERSION_PATH)-1UL ) );
+    fd_grpc_server_params_t const * p = &c->server->params;
+    ulong stream_path_len  = strlen( p->stream_path );
+    ulong version_path_len = p->version_path ? strlen( p->version_path ) : 0UL;
+    int is_sub = ( s->path_len==stream_path_len &&
+                   fd_memeq( s->path, p->stream_path, stream_path_len ) );
+    int is_ver = ( version_path_len && s->path_len==version_path_len &&
+                   fd_memeq( s->path, p->version_path, version_path_len ) );
     if( is_sub ) {
       s->kind        = FD_GRPC_SK_SUBSCRIBE;
       c->sub_slot    = (long)( s - c->streams );
@@ -292,6 +292,12 @@ fd_grpc_server_new( void *                             mem,
                     void *                             ctx ) {
   if( FD_UNLIKELY( !mem ) ) { FD_LOG_WARNING(( "NULL mem" )); return NULL; }
   if( FD_UNLIKELY( !params.max_conn_cnt ) ) { FD_LOG_WARNING(( "zero max_conn_cnt" )); return NULL; }
+  if( FD_UNLIKELY( !params.stream_path  ) ) { FD_LOG_WARNING(( "NULL stream_path" )); return NULL; }
+  if( FD_UNLIKELY( params.version_path && ( !params.version_resp ||
+                   strlen( params.version_resp )>FD_GRPC_SERVER_VERSION_MAX ) ) ) {
+    FD_LOG_WARNING(( "invalid version_resp" ));
+    return NULL;
+  }
 
   FD_SCRATCH_ALLOC_INIT( l, mem );
   fd_grpc_server_t * server = FD_SCRATCH_ALLOC_APPEND( l, fd_grpc_server_align(),         sizeof(fd_grpc_server_t)                            );
@@ -356,6 +362,25 @@ fd_grpc_server_close( fd_grpc_server_t * server,
   fd_grpc_server_conn_t * c = &server->conns[ conn_id ];
   if( FD_UNLIKELY( !c->used ) ) return;
   if( c->sub_slot>=0L && server->cb->stream_close ) server->cb->stream_close( server->cb_ctx, c->conn_id );
+
+  /* Best-effort graceful shutdown: tell the peer why the stream ended
+     (grpc-status: 8, resource exhausted -- eviction of a slow consumer)
+     followed by a GOAWAY, rather than a bare TCP reset.  Skipped when
+     the conn is not established or the tx ring is congested. */
+  if( c->got_preface && !( c->conn->flags & FD_H2_CONN_FLAGS_DEAD ) &&
+      fd_h2_rbuf_free_sz( c->rbuf_tx )>=128UL ) {
+    if( c->sub_slot>=0L && c->streams[ c->sub_slot ].used ) {
+      static uchar const trailers[] = {
+        0x00, 0x0b, 'g','r','p','c','-','s','t','a','t','u','s', 0x01, '8'
+      };
+      fd_h2_tx( c->rbuf_tx, trailers, sizeof(trailers), FD_H2_FRAME_TYPE_HEADERS,
+                (uint)(FD_H2_FLAG_END_HEADERS|FD_H2_FLAG_END_STREAM), c->streams[ c->sub_slot ].id );
+    }
+    fd_h2_conn_error( c->conn, FD_H2_SUCCESS ); /* queue graceful GOAWAY */
+    fd_h2_tx_control( c->conn, c->rbuf_tx, &fd_grpc_server_h2_cb );
+    fd_h2_rbuf_sendmsg( c->rbuf_tx, c->sock, MSG_NOSIGNAL ); /* best effort */
+  }
+
   if( c->sock>=0 ) close( c->sock );
   fd_grpc_server_conn_reset( c );
 }
@@ -377,7 +402,7 @@ fd_grpc_server_accept( fd_grpc_server_t * server ) {
       if( !server->conns[ i ].used ) { c = &server->conns[ i ]; break; }
     }
     if( FD_UNLIKELY( !c ) ) { /* at capacity */
-      FD_LOG_WARNING(( "geyser: dropping new connection, at capacity (%lu conns)", server->params.max_conn_cnt ));
+      FD_LOG_WARNING(( "grpc_server: dropping new connection, at capacity (%lu conns)", server->params.max_conn_cnt ));
       close( s );
       continue;
     }
@@ -434,10 +459,12 @@ fd_grpc_server_send_getversion( fd_grpc_server_conn_t * c,
   };
   fd_h2_tx( c->rbuf_tx, resp_hdrs, sizeof(resp_hdrs), FD_H2_FRAME_TYPE_HEADERS, FD_H2_FLAG_END_HEADERS, stream_id );
 
-  /* GetVersionResponse { string version = 1 }, gRPC length-prefixed. */
-  static char const ver[]  = FD_GRPC_SERVER_VERSION;
-  ulong             verlen = sizeof(ver)-1UL; /* < 128 */
-  uchar msg[ 5 + 2 + sizeof(ver) ];
+  /* GetVersionResponse { string version = 1 }, gRPC length-prefixed.
+     verlen <= FD_GRPC_SERVER_VERSION_MAX (enforced in new), so the
+     varint length prefix is a single byte. */
+  char const * ver    = c->server->params.version_resp;
+  ulong        verlen = fd_ulong_min( strlen( ver ), FD_GRPC_SERVER_VERSION_MAX );
+  uchar msg[ 5 + 2 + FD_GRPC_SERVER_VERSION_MAX ];
   ulong pb = 0UL;
   msg[ 5+pb++ ] = 0x0a;             /* field 1, wire type 2 (LEN) */
   msg[ 5+pb++ ] = (uchar)verlen;    /* single-byte varint length */
@@ -550,7 +577,7 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   if( fd_h2_rbuf_used_sz( c->rbuf_tx ) ) {
     int tx_err = fd_h2_rbuf_sendmsg( c->rbuf_tx, c->sock, MSG_NOSIGNAL );
     if( FD_UNLIKELY( tx_err && tx_err!=EAGAIN ) ) {
-      FD_LOG_WARNING(( "geyser: conn %lu sendmsg failed (%i-%s)", c->conn_id, tx_err, fd_io_strerror( tx_err ) ));
+      FD_LOG_WARNING(( "grpc_server: conn %lu sendmsg failed (%i-%s)", c->conn_id, tx_err, fd_io_strerror( tx_err ) ));
       fd_grpc_server_close( server, c->conn_id );
       return 1;
     }
@@ -558,7 +585,7 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   }
 
   if( FD_UNLIKELY( c->conn->flags & FD_H2_CONN_FLAGS_DEAD ) ) {
-    FD_LOG_WARNING(( "geyser: conn %lu h2 GOAWAY (err=%u-%s) [tx path]", c->conn_id,
+    FD_LOG_WARNING(( "grpc_server: conn %lu h2 GOAWAY (err=%u-%s) [tx path]", c->conn_id,
                      (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
     fd_grpc_server_close( server, c->conn_id );
     return 1;
@@ -572,7 +599,7 @@ fd_grpc_server_service_conn( fd_grpc_server_t *      server,
   }
 
   if( FD_UNLIKELY( c->conn->flags & FD_H2_CONN_FLAGS_DEAD ) ) {
-    FD_LOG_WARNING(( "geyser: conn %lu h2 GOAWAY (err=%u-%s) [rx path]", c->conn_id,
+    FD_LOG_WARNING(( "grpc_server: conn %lu h2 GOAWAY (err=%u-%s) [rx path]", c->conn_id,
                      (uint)c->conn->conn_error, fd_h2_strerror( (uint)c->conn->conn_error ) ));
     fd_grpc_server_close( server, c->conn_id );
     return 1;
@@ -591,10 +618,14 @@ fd_grpc_server_listen( fd_grpc_server_t * server,
   if( FD_UNLIKELY( s<0 ) ) return -errno;
 
   int one = 1;
-  setsockopt( s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int) );
+  if( FD_UNLIKELY( setsockopt( s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int) )<0 ) ) {
+    int e=errno; close( s ); return -e;
+  }
 
   int fl = fcntl( s, F_GETFL, 0 );
-  if( fl<0 || fcntl( s, F_SETFL, fl|O_NONBLOCK )<0 ) { int e=errno; close( s ); return -e; }
+  if( FD_UNLIKELY( fl<0 || fcntl( s, F_SETFL, fl|O_NONBLOCK )<0 ) ) {
+    int e=errno; close( s ); return -e;
+  }
 
   struct sockaddr_in addr = {0};
   addr.sin_family      = AF_INET;
