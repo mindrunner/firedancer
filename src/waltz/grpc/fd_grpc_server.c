@@ -20,6 +20,13 @@
    framed message + trailers) always fits comfortably in one tx pass. */
 #define FD_GRPC_SERVER_VERSION_MAX (120UL)
 
+/* Idle connections (no traffic, no open streaming RPC) are closed
+   gracefully after this long.  Proxies such as Envoy hold pooled
+   upstream connections open indefinitely; without reaping, the pool
+   monopolizes all connection slots and new connections get dropped at
+   accept. */
+#define FD_GRPC_SERVER_IDLE_TIMEOUT_NS ((long)60e9)
+
 /* Per-connection state. */
 
 /* Max concurrent HTTP/2 streams per connection.  Proxies such as Envoy
@@ -53,6 +60,7 @@ struct fd_grpc_server_conn {
   int   sock;          /* TCP socket, -1 if slot free                */
   uint  used;          /* 1 if slot in use                           */
   uint  got_preface;   /* 1 once the 24B client preface was consumed */
+  long  last_active;   /* wallclock of last observed activity        */
 
   fd_grpc_server_t * server;
   ulong              conn_id;
@@ -92,6 +100,8 @@ struct fd_grpc_server {
   fd_grpc_server_params_t            params;
   fd_grpc_server_callbacks_t const * cb;
   void *                             cb_ctx;
+
+  long now; /* wallclock of the current poll pass */
 
   int listen_sock;
 
@@ -399,21 +409,36 @@ fd_grpc_server_accept( fd_grpc_server_t * server ) {
       break;
     }
 
-    /* Find a free conn slot. */
+    /* Find a free conn slot.  At capacity, evict the longest-idle
+       connection without an active streaming RPC (proxies keep pooled
+       connections open forever; a new client beats a stale pool conn).
+       Only if every slot has a live subscription is the new connection
+       dropped. */
     fd_grpc_server_conn_t * c = NULL;
     for( ulong i=0UL; i<server->params.max_conn_cnt; i++ ) {
       if( !server->conns[ i ].used ) { c = &server->conns[ i ]; break; }
     }
-    if( FD_UNLIKELY( !c ) ) { /* at capacity */
-      FD_LOG_WARNING(( "grpc_server: dropping new connection, at capacity (%lu conns)", server->params.max_conn_cnt ));
-      close( s );
-      continue;
+    if( FD_UNLIKELY( !c ) ) {
+      fd_grpc_server_conn_t * victim = NULL;
+      for( ulong i=0UL; i<server->params.max_conn_cnt; i++ ) {
+        fd_grpc_server_conn_t * v = &server->conns[ i ];
+        if( v->sub_slot>=0L ) continue;
+        if( !victim || v->last_active<victim->last_active ) victim = v;
+      }
+      if( FD_UNLIKELY( !victim ) ) { /* every conn has a live subscription */
+        FD_LOG_WARNING(( "grpc_server: dropping new connection, at capacity (%lu conns, all subscribed)", server->params.max_conn_cnt ));
+        close( s );
+        continue;
+      }
+      fd_grpc_server_close( server, victim->conn_id );
+      c = victim;
     }
 
     fd_grpc_server_conn_reset( c );
     c->sock        = s;
     c->used        = 1U;
     c->got_preface = 0U;
+    c->last_active = server->now;
     fd_hpack_dt_init( c->hpack_dt );
     fd_h2_rbuf_init( c->rbuf_rx, c->rx_buf,  server->params.conn_rx_buf_sz  );
     fd_h2_rbuf_init( c->rbuf_tx, c->tx_buf,  server->params.conn_tx_buf_sz  );
@@ -651,6 +676,8 @@ fd_grpc_server_listen( fd_grpc_server_t * server,
 int
 fd_grpc_server_poll( fd_grpc_server_t * server,
                      int *              charge_busy ) {
+  server->now = fd_log_wallclock();
+
   int busy = 0;
   if( FD_LIKELY( server->listen_sock>=0 ) ) busy |= fd_grpc_server_accept( server );
 
@@ -658,8 +685,17 @@ fd_grpc_server_poll( fd_grpc_server_t * server,
   for( ulong i=0UL; i<server->params.max_conn_cnt; i++ ) {
     fd_grpc_server_conn_t * c = &server->conns[ i ];
     if( !c->used ) continue;
+
+    /* Reap idle pooled connections (no traffic, no streaming RPC). */
+    if( FD_UNLIKELY( c->sub_slot<0L && server->now-c->last_active>FD_GRPC_SERVER_IDLE_TIMEOUT_NS ) ) {
+      fd_grpc_server_close( server, c->conn_id );
+      continue;
+    }
+
     serviced++;
-    busy |= fd_grpc_server_service_conn( server, c );
+    int conn_busy = fd_grpc_server_service_conn( server, c );
+    if( conn_busy && c->used ) c->last_active = server->now;
+    busy |= conn_busy;
   }
 
   if( busy && charge_busy ) *charge_busy = 1;
