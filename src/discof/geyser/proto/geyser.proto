@@ -67,10 +67,17 @@ message SubscribeRequestPing {
 message SubscribeUpdate {
   repeated string         filters = 1;
   /* update_oneof */
-  SubscribeUpdateAccount  account = 2; /* reserved (v2) */
+  SubscribeUpdateAccount  account = 2;
   SubscribeUpdateSlot     slot    = 3;
   SubscribeUpdatePing     ping    = 6;
   SubscribeUpdatePong     pong    = 9;
+  /* google.protobuf.Timestamp: server-side send time */
+  Timestamp               created_at = 11;
+}
+
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos   = 2;
 }
 
 message SubscribeUpdateSlot {
