@@ -9,6 +9,7 @@ $(call add-objs,fd_grpc_client,fd_waltz)
 
 $(call add-hdrs,fd_grpc_server.h)
 $(call add-objs,fd_grpc_server,fd_waltz)
+$(call make-unit-test,test_grpc_server,test_grpc_server,fd_waltz fd_util)
 
 $(call make-unit-test,test_grpc_client,test_grpc_client,fd_waltz fd_ballet fd_util,$(OPENSSL_LIBS))
 $(call run-unit-test,test_grpc_client)

@@ -4,6 +4,8 @@
 #include "nghttp2_hd_huffman.h"
 #include "../../util/log/fd_log.h"
 
+#include <string.h> /* memmove */
+
 fd_hpack_static_entry_t const
 fd_hpack_static_table[ 62 ] = {
   [  1 ] = { ":authority",                       10,  0 },
@@ -69,6 +71,81 @@ fd_hpack_static_table[ 62 ] = {
   [ 61 ] = { "www-authenticate",                 16,  0 }
 };
 
+/* Dynamic table (RFC 7541 §4) ------------------------------------------*/
+
+fd_hpack_dt_t *
+fd_hpack_dt_init( fd_hpack_dt_t * dt ) {
+  dt->max_sz    = FD_HPACK_DT_MAX; /* RFC 7541 initial SETTINGS_HEADER_TABLE_SIZE */
+  dt->used_sz   = 0UL;
+  dt->entry_cnt = 0UL;
+  return dt;
+}
+
+/* fd_hpack_dt_evict1 removes the oldest entry.  Assumes entry_cnt>0. */
+
+static void
+fd_hpack_dt_evict1( fd_hpack_dt_t * dt ) {
+  fd_hpack_dt_entry_t e0 = dt->entry[ 0 ];
+  ulong b          = (ulong)e0.name_len + (ulong)e0.value_len;
+  ulong bytes_used = dt->used_sz - 32UL*dt->entry_cnt;
+  memmove( dt->arena, dt->arena+b, bytes_used-b );
+  for( ulong i=1UL; i<dt->entry_cnt; i++ ) {
+    dt->entry[ i-1UL ]      = dt->entry[ i ];
+    dt->entry[ i-1UL ].off  = (ushort)( dt->entry[ i-1UL ].off - b );
+  }
+  dt->entry_cnt--;
+  dt->used_sz -= b + 32UL;
+}
+
+/* fd_hpack_dt_resize applies a dynamic table size update.  Returns 1 on
+   success, 0 if new_max exceeds the protocol limit. */
+
+static int
+fd_hpack_dt_resize( fd_hpack_dt_t * dt,
+                    ulong           new_max ) {
+  if( FD_UNLIKELY( new_max>FD_HPACK_DT_MAX ) ) return 0;
+  while( dt->used_sz>new_max ) fd_hpack_dt_evict1( dt );
+  dt->max_sz = new_max;
+  return 1;
+}
+
+/* fd_hpack_dt_insert adds an entry (evicting as needed).  An entry
+   larger than the table empties the table without adding, per RFC 7541
+   §4.4.  name/value may alias dt->arena (indexed name); the copy via
+   tmp makes eviction compaction safe. */
+
+static void
+fd_hpack_dt_insert( fd_hpack_dt_t * dt,
+                    char const *    name,
+                    ulong           name_len,
+                    char const *    value,
+                    ulong           value_len ) {
+  ulong need = name_len + value_len + 32UL;
+  if( FD_UNLIKELY( need>dt->max_sz ) ) {
+    dt->entry_cnt = 0UL;
+    dt->used_sz   = 0UL;
+    return;
+  }
+
+  uchar tmp[ FD_HPACK_DT_MAX ];
+  fd_memcpy( tmp,          name,  name_len  );
+  fd_memcpy( tmp+name_len, value, value_len );
+
+  while( dt->used_sz+need > dt->max_sz ) fd_hpack_dt_evict1( dt );
+
+  ulong bytes_used = dt->used_sz - 32UL*dt->entry_cnt;
+  fd_memcpy( dt->arena+bytes_used, tmp, name_len+value_len );
+  dt->entry[ dt->entry_cnt ] = (fd_hpack_dt_entry_t) {
+    .off       = (ushort)bytes_used,
+    .name_len  = (ushort)name_len,
+    .value_len = (ushort)value_len,
+  };
+  dt->entry_cnt++;
+  dt->used_sz += need;
+}
+
+/* Reader --------------------------------------------------------------*/
+
 fd_hpack_rd_t *
 fd_hpack_rd_init( fd_hpack_rd_t * rd,
                   uchar const *   src,
@@ -92,21 +169,62 @@ fd_hpack_rd_init( fd_hpack_rd_t * rd,
   return rd;
 }
 
-/* fd_hpack_rd_indexed selects a header from HPACK dictionaries.
-   Currently, only supports the static table.  (Pretends that the
-   dynamic table size is 0). */
+fd_hpack_rd_t *
+fd_hpack_rd_init_dt( fd_hpack_rd_t * rd,
+                     uchar const *   src,
+                     ulong           srcsz,
+                     fd_hpack_dt_t * dt ) {
+  *rd = (fd_hpack_rd_t) {
+    .src     = src,
+    .src_end = src+srcsz,
+    .dt      = dt
+  };
+  /* Apply leading dynamic table size updates (only legal at the start
+     of a header block, RFC 7541 §4.2). */
+  while( FD_LIKELY( rd->src < rd->src_end ) ) {
+    uint b0 = rd->src[0];
+    if( (b0&0xe0)!=0x20 ) break;
+    rd->src++;
+    ulong new_max = fd_hpack_rd_varint( rd, b0, 0x1f );
+    if( FD_UNLIKELY( new_max==ULONG_MAX || !fd_hpack_dt_resize( dt, new_max ) ) ) {
+      rd->err = FD_H2_ERR_COMPRESSION;
+      break;
+    }
+  }
+  return rd;
+}
+
+/* fd_hpack_rd_indexed selects a header from the HPACK static table or
+   the reader's dynamic table (if any). */
 
 static uint
-fd_hpack_rd_indexed( fd_h2_hdr_t * hdr,
-                     ulong         idx ) {
-  if( FD_UNLIKELY( idx==0 || idx>61 ) ) return FD_H2_ERR_COMPRESSION;
-  fd_hpack_static_entry_t const * entry = &fd_hpack_static_table[ idx ];
+fd_hpack_rd_indexed( fd_hpack_rd_t const * rd,
+                     fd_h2_hdr_t *         hdr,
+                     ulong                 idx ) {
+  if( FD_UNLIKELY( idx==0 ) ) return FD_H2_ERR_COMPRESSION;
+
+  if( FD_LIKELY( idx<=61 ) ) {
+    fd_hpack_static_entry_t const * entry = &fd_hpack_static_table[ idx ];
+    *hdr = (fd_h2_hdr_t) {
+      .name      = entry->entry,
+      .name_len  = entry->name_len,
+      .value     = entry->entry + entry->name_len,
+      .value_len = entry->value_len,
+      .hint      = (ushort)idx | FD_H2_HDR_HINT_NAME_INDEXED,
+    };
+    return FD_H2_SUCCESS;
+  }
+
+  fd_hpack_dt_t * dt   = rd->dt;
+  ulong           didx = idx-62UL;
+  if( FD_UNLIKELY( !dt || didx>=dt->entry_cnt ) ) return FD_H2_ERR_COMPRESSION;
+  fd_hpack_dt_entry_t const * e = &dt->entry[ dt->entry_cnt-1UL-didx ];
   *hdr = (fd_h2_hdr_t) {
-    .name      = entry->entry,
-    .name_len  = entry->name_len,
-    .value     = entry->entry + entry->name_len,
-    .value_len = entry->value_len,
-    .hint      = (ushort)idx | FD_H2_HDR_HINT_NAME_INDEXED,
+    .name      = (char const *)( dt->arena + e->off ),
+    .name_len  = e->name_len,
+    .value     = (char const *)( dt->arena + e->off + e->name_len ),
+    .value_len = e->value_len,
+    .hint      = FD_H2_HDR_HINT_NAME_INDEXED,
   };
   return FD_H2_SUCCESS;
 }
@@ -121,7 +239,7 @@ fd_hpack_rd_next_raw( fd_hpack_rd_t * rd,
 
   if( (b0&0xc0)==0x80 ) {
     /* name indexed, value indexed, index in [0,63], varint sz 0 */
-    uint err = fd_hpack_rd_indexed( hdr, b0&0x7f );
+    uint err = fd_hpack_rd_indexed( rd, hdr, b0&0x7f );
     hdr->hint |= FD_H2_HDR_HINT_VALUE_INDEXED;
     return err;
   }
@@ -149,13 +267,15 @@ fd_hpack_rd_next_raw( fd_hpack_rd_t * rd,
     hdr->value     = (char const *)value_p;
     hdr->value_len = (uint)value_len;
     hdr->hint      = fd_ushort_if( name_word&0x80,  FD_H2_HDR_HINT_NAME_HUFFMAN,  0 ) |
-                     fd_ushort_if( value_word&0x80, FD_H2_HDR_HINT_VALUE_HUFFMAN, 0 );
+                     fd_ushort_if( value_word&0x80, FD_H2_HDR_HINT_VALUE_HUFFMAN, 0 ) |
+                     fd_ushort_if( b0==0x40,        FD_H2_HDR_HINT_INSERT,        0 );
     return FD_H2_SUCCESS;
   }
 
   if( (b0&0xc0)==0x40 || (b0&0xf0)==0x00 || (b0&0xf0)==0x10 ) {
     /* name indexed, value literal */
-    uint  name_mask = (b0&0xc0)==0x40 ? 0x3f : 0x0f;
+    int   do_insert = ( (b0&0xc0)==0x40 );
+    uint  name_mask = do_insert ? 0x3f : 0x0f;
     ulong name_idx  = fd_hpack_rd_varint( rd, b0, name_mask );
 
     if( FD_UNLIKELY( rd->src >= end ) ) return FD_H2_ERR_COMPRESSION;
@@ -166,18 +286,21 @@ fd_hpack_rd_next_raw( fd_hpack_rd_t * rd,
     uchar const * value_p = rd->src;
     rd->src += value_len;
 
-    uint err = fd_hpack_rd_indexed( hdr, name_idx );
+    uint err = fd_hpack_rd_indexed( rd, hdr, name_idx );
     if( FD_UNLIKELY( err ) ) return FD_H2_ERR_COMPRESSION;
     hdr->value     = (char const *)value_p;
     hdr->value_len = (uint)value_len;
-    hdr->hint     |= fd_ushort_if( value_word&0x80, FD_H2_HDR_HINT_VALUE_HUFFMAN, 0 );
+    hdr->hint     |= fd_ushort_if( value_word&0x80, FD_H2_HDR_HINT_VALUE_HUFFMAN, 0 ) |
+                     fd_ushort_if( do_insert,       FD_H2_HDR_HINT_INSERT,        0 );
     return FD_H2_SUCCESS;
   }
 
   if( FD_UNLIKELY( (b0&0xc0)==0xc0 ) ) {
     /* name indexed, value indexed, index >=128 */
     ulong idx = fd_hpack_rd_varint( rd, b0, 0x7f ); /* may fail */
-    return fd_hpack_rd_indexed( hdr, idx );
+    uint err = fd_hpack_rd_indexed( rd, hdr, idx );
+    hdr->hint |= FD_H2_HDR_HINT_VALUE_INDEXED;
+    return err;
   }
 
   /* FIXME slow */
@@ -215,6 +338,8 @@ fd_hpack_rd_next( fd_hpack_rd_t * hpack_rd,
                   fd_h2_hdr_t *   hdr,
                   uchar **        scratch,
                   uchar *         scratch_end ) {
+  if( FD_UNLIKELY( hpack_rd->err ) ) return hpack_rd->err;
+
   uint err = fd_hpack_rd_next_raw( hpack_rd, hdr );
   if( FD_UNLIKELY( err ) ) return err;
 
@@ -243,6 +368,22 @@ fd_hpack_rd_next( fd_hpack_rd_t * hpack_rd,
   }
 
   *scratch = scratch_;
-  hdr->hint &= (ushort)~FD_H2_HDR_HINT_HUFFMAN;
+
+  /* Literal-with-incremental-indexing: add the (decoded) entry to the
+     dynamic table, then re-point hdr at the table's stable copy (the
+     insert may have compacted arena bytes an indexed name pointed at). */
+  if( FD_UNLIKELY( hdr->hint & FD_H2_HDR_HINT_INSERT ) ) {
+    fd_hpack_dt_t * dt = hpack_rd->dt;
+    if( FD_LIKELY( dt ) ) {
+      fd_hpack_dt_insert( dt, hdr->name, hdr->name_len, hdr->value, hdr->value_len );
+      if( FD_LIKELY( dt->entry_cnt ) ) { /* not emptied by an oversize entry */
+        fd_hpack_dt_entry_t const * e = &dt->entry[ dt->entry_cnt-1UL ];
+        hdr->name  = (char const *)( dt->arena + e->off );
+        hdr->value = (char const *)( dt->arena + e->off + e->name_len );
+      }
+    }
+  }
+
+  hdr->hint &= (ushort)~( FD_H2_HDR_HINT_HUFFMAN | FD_H2_HDR_HINT_INSERT );
   return FD_H2_SUCCESS;
 }
