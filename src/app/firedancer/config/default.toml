@@ -1718,8 +1718,9 @@ telemetry = true
 
         # The maximum number of concurrent gRPC connections.  Each
         # connection has its own outbound ring sized to hold a fully
-        # reassembled account update, so this trades directly against
-        # memory (~1.5 MiB per connection).  Note that a fronting proxy
+        # reassembled max-size account update (10 MiB), so this trades
+        # directly against memory (~10.5 MiB per connection, ~700 MiB
+        # at the default).  Note that a fronting proxy
         # (e.g. Envoy) pools upstream connections per worker thread, so
         # this must comfortably exceed the proxy's worker count; idle
         # pooled connections are reaped after 60s and the longest-idle
