@@ -549,7 +549,7 @@ fd_topo_initialize( config_t * config ) {
     FOR(execle_tile_cnt)   fd_topob_link( topo, "execle_poh",    "execle_poh",    16384UL,                                  USHORT_MAX,                    1UL );
     if( FD_UNLIKELY( geyser_enabled && execle_tile_cnt ) ) {
       fd_topob_wksp( topo, "execle_geyser" );
-      FOR(execle_tile_cnt) fd_topob_link( topo, "execle_geyser", "execle_geyser", 256UL,                                    USHORT_MAX,                    1UL );
+      FOR(execle_tile_cnt) fd_topob_link( topo, "execle_geyser", "execle_geyser", 512UL,                                    USHORT_MAX,                    1UL );
     }
     /* pack_execle is shared across all execle, so if one executor stalls
        due to complex transactions, the buffer needs to be large so that
@@ -585,7 +585,7 @@ fd_topo_initialize( config_t * config ) {
 
   if( FD_UNLIKELY( geyser_enabled && execrp_tile_cnt ) ) {
     fd_topob_wksp( topo, "execrp_geyser" );
-    FOR(execrp_tile_cnt) fd_topob_link( topo, "execrp_geyser", "execrp_geyser", 256UL,                                    USHORT_MAX,                       1UL );
+    FOR(execrp_tile_cnt) fd_topob_link( topo, "execrp_geyser", "execrp_geyser", 512UL,                                    USHORT_MAX,                       1UL );
   }
 
   ushort parsed_tile_to_cpu[ FD_TILE_MAX ];
