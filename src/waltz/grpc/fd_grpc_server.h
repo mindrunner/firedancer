@@ -13,17 +13,23 @@
    services HTTP/2 frames, and flushes queued response messages while
    respecting HTTP/2 flow control.
 
-   This v1 implementation targets server-streaming RPCs (one request
-   message followed by an open-ended stream of response messages), which
-   is what the Yellowstone Geyser `Subscribe` method needs.  Each
-   connection carries at most one concurrent stream.
+   This v1 implementation targets one server-streaming RPC (one request
+   message followed by an open-ended stream of response messages, which
+   is what the Yellowstone Geyser `Subscribe` method needs) plus an
+   optional canned unary "version" RPC.  Each connection supports
+   multiple concurrent streams (proxies such as Envoy multiplex many
+   client requests onto one pooled upstream connection); at most one of
+   them is the long-lived streaming RPC.
 
    Transport security (TLS) and authentication are out of scope here and
    are layered in by the caller in a later phase. */
 
 #include "../h2/fd_h2_base.h"
 
-/* fd_grpc_server_params_t configures sizing of a server instance. */
+/* fd_grpc_server_params_t configures a server instance.  The three
+   cstr fields are borrowed (must outlive the server); they carry the
+   service-specific knowledge so this module stays application
+   agnostic. */
 
 struct fd_grpc_server_params {
   ulong max_conn_cnt;     /* max concurrent TCP connections          */
@@ -31,6 +37,14 @@ struct fd_grpc_server_params {
   ulong conn_tx_buf_sz;   /* per-conn HTTP/2 transmit ring size      */
   ulong conn_out_buf_sz;  /* per-conn outbound gRPC message ring     */
   ulong max_request_sz;   /* max size of a single inbound gRPC msg   */
+
+  char const * stream_path;   /* :path of the server-streaming RPC
+                                 (e.g. "/geyser.Geyser/Subscribe") */
+  char const * version_path;  /* :path of the unary version RPC, or
+                                 NULL to disable it */
+  char const * version_resp;  /* version string returned as field 1 of
+                                 the version RPC response (<=120 bytes;
+                                 ignored if version_path is NULL) */
 };
 
 typedef struct fd_grpc_server_params fd_grpc_server_params_t;
@@ -71,17 +85,29 @@ typedef struct fd_grpc_server fd_grpc_server_t;
 
 FD_PROTOTYPES_BEGIN
 
+/* fd_grpc_server_{align,footprint} describe the memory region required
+   to back a server instance with the given params.  footprint returns 0
+   if params are invalid. */
+
 ulong
 fd_grpc_server_align( void );
 
 ulong
 fd_grpc_server_footprint( fd_grpc_server_params_t params );
 
+/* fd_grpc_server_new formats a memory region (matching align/footprint)
+   as a grpc server.  callbacks and ctx are borrowed for the server's
+   lifetime.  Returns mem on success, NULL on invalid args (logs
+   warning).  No listen socket is opened yet. */
+
 void *
 fd_grpc_server_new( void *                             mem,
                     fd_grpc_server_params_t            params,
                     fd_grpc_server_callbacks_t const * callbacks,
                     void *                             ctx );
+
+/* fd_grpc_server_join joins the caller to a server instance created by
+   fd_grpc_server_new in this address space. */
 
 fd_grpc_server_t *
 fd_grpc_server_join( void * mem );

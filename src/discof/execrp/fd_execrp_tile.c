@@ -216,6 +216,12 @@ execrp_publish_geyser_accounts( fd_execrp_tile_t *  ctx,
   fd_txn_out_t * to = &ctx->txn_out;
   if( FD_UNLIKELY( !to->err.is_committable ) ) return;       /* canceled: nothing persisted */
 
+  /* Note on STEM_BURST: this can publish many fragments per stem
+     callback (several accounts, each up to ~17 fragments), but the
+     geyser link has no reliable consumer, so fd_stem_publish does not
+     consume flow control credits for it (see out_reliable in
+     fd_stem.c) and the STEM_BURST contract is unaffected. */
+
   ulong         slot = ctx->bank->f.slot;
   uchar const * sig  = to->details.signature.uc;
 

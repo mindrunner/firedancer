@@ -180,11 +180,20 @@ execle_publish_geyser_accounts( fd_execle_tile_t *   ctx,
                                 ulong                slot ) {
   if( FD_LIKELY( ctx->out_geyser->idx==ULONG_MAX ) ) return; /* geyser disabled */
   if( FD_UNLIKELY( !to->err.is_committable ) ) return;
+
+  /* Note on STEM_BURST: this can publish many fragments per stem
+     callback (several accounts, each up to ~17 fragments), but the
+     geyser link has no reliable consumer, so fd_stem_publish does not
+     consume flow control credits for it (see out_reliable in
+     fd_stem.c) and the STEM_BURST contract is unaffected. */
+
   uchar const * sig = to->details.signature.uc;
   if( FD_LIKELY( !to->err.txn_err ) ) {
-    for( ushort i=0; i<to->accounts.cnt; i++ )
-      if( to->accounts.is_writable[ i ] && to->accounts.account_acquired[ i ] )
+    for( ushort i=0; i<to->accounts.cnt; i++ ) {
+      if( to->accounts.is_writable[ i ] && to->accounts.account_acquired[ i ] ) {
         execle_publish_one_geyser_account( ctx, stem, to, i, slot, sig );
+      }
+    }
   } else {
     ulong ni = to->accounts.nonce_idx_in_txn;
     if( ni!=ULONG_MAX )            execle_publish_one_geyser_account( ctx, stem, to, ni,                   slot, sig );
@@ -827,8 +836,9 @@ unprivileged_init( fd_topo_t const *      topo,
 
   *ctx->out_geyser = out1( topo, tile, "execle_geyser" );
   ctx->geyser_mtu  = 0UL;
-  if( FD_UNLIKELY( ctx->out_geyser->idx!=ULONG_MAX ) )
+  if( FD_UNLIKELY( ctx->out_geyser->idx!=ULONG_MAX ) ) {
     ctx->geyser_mtu = topo->links[ tile->out_link_id[ ctx->out_geyser->idx ] ].mtu;
+  }
 
   ctx->enable_rebates = ctx->out_pack->idx!=ULONG_MAX;
 
