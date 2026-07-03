@@ -50,23 +50,40 @@
 #define GEYSER_SLOT_CONFIRMED (1)
 #define GEYSER_SLOT_FINALIZED (2)
 
+/* Max named entries in the SubscribeRequest.accounts map. */
+#define GEYSER_SUB_FILTER_MAX (4UL)
+
+/* One named entry of the SubscribeRequest.accounts map.  Yellowstone
+   semantics: within an entry, a non-empty account list AND a non-empty
+   owner list must BOTH match; an empty list is a wildcard; an entry
+   with both lists empty matches every account. */
+struct geyser_acct_filter {
+  char  key[ GEYSER_FILTER_KEY_MAX ];
+  ulong key_len;
+  ulong pubkey_cnt;
+  uchar pubkeys[ GEYSER_SUB_ACCT_MAX ][ 32 ];
+  ulong owner_cnt;
+  uchar owners[ GEYSER_SUB_OWNER_MAX ][ 32 ];
+};
+
+typedef struct geyser_acct_filter geyser_acct_filter_t;
+
 /* Per-subscriber (per gRPC connection) state. */
 
 struct geyser_sub {
   int   wants_slots;
-  int   wants_accounts;
   uint  commitment;
 
   char  slot_filter_key[ GEYSER_FILTER_KEY_MAX ];
   ulong slot_filter_key_len;
 
-  char  acct_filter_key[ GEYSER_FILTER_KEY_MAX ];
-  ulong acct_filter_key_len;
+  ulong                acct_filter_cnt;
+  geyser_acct_filter_t acct_filters[ GEYSER_SUB_FILTER_MAX ];
 
-  ulong acct_pubkey_cnt;
-  uchar acct_pubkeys[ GEYSER_SUB_ACCT_MAX ][ 32 ];
-  ulong owner_cnt;
-  uchar owners[ GEYSER_SUB_OWNER_MAX ][ 32 ];
+  /* SubscribeRequest.ping: a ping-only request must not replace the
+     subscription; it just solicits a Pong. */
+  int ping_present;
+  int ping_id;
 };
 
 typedef struct geyser_sub geyser_sub_t;
@@ -120,6 +137,10 @@ typedef struct fd_geyser_tile fd_geyser_tile_t;
 
 /* Server sizing derived from tile config. -----------------------------*/
 
+/* Version string returned by the unary GetVersion RPC (Yellowstone
+   convention is a JSON blob; clients read it as an opaque string). */
+#define GEYSER_VERSION_JSON "{\"version\":\"0.1.0\",\"package\":\"firedancer-geyser\",\"proto\":\"1.0.0\"}"
+
 static fd_grpc_server_params_t
 derive_server_params( fd_topo_tile_t const * tile ) {
   ulong max_conn = fd_ulong_max( 1UL, tile->geyser.max_connections );
@@ -137,12 +158,15 @@ derive_server_params( fd_topo_tile_t const * tile ) {
     .conn_tx_buf_sz  = 1UL<<18UL, /* 256 KiB */
     .conn_out_buf_sz = per_conn_out,
     .max_request_sz  = 1UL<<16UL, /* 64 KiB */
+    .stream_path     = "/geyser.Geyser/Subscribe",
+    .version_path    = "/geyser.Geyser/GetVersion",
+    .version_resp    = GEYSER_VERSION_JSON,
   };
 }
 
 /* Minimal Protobuf scanning for SubscribeRequest. ---------------------*/
 
-static ulong
+static int
 geyser_pb_read_varint( uchar const * p,
                        ulong         sz,
                        ulong *       pos,
@@ -153,14 +177,14 @@ geyser_pb_read_varint( uchar const * p,
   while( i<sz && shift<64 ) {
     uchar b = p[ i++ ];
     val |= (ulong)( b & 0x7FU ) << shift;
-    if( !( b & 0x80U ) ) { *pos = i; *out = val; return 1UL; }
+    if( !( b & 0x80U ) ) { *pos = i; *out = val; return 1; }
     shift += 7;
   }
-  return 0UL; /* truncated */
+  return 0; /* truncated */
 }
 
 /* Skip a field given its wire type.  Returns 1 on success. */
-static ulong
+static int
 geyser_pb_skip( uchar const * p,
                 ulong         sz,
                 ulong *       pos,
@@ -218,12 +242,14 @@ geyser_b58_pubkey( uchar const * s,
   return fd_base58_decode_32( tmp, out )!=NULL;
 }
 
-/* Parse a SubscribeRequestFilterAccounts value: field 2 = account[]
-   (base58), field 3 = owner[] (base58). */
+/* Parse a SubscribeRequestFilterAccounts value into one filter entry:
+   field 2 = account[] (base58), field 3 = owner[] (base58).  Entries in
+   excess of the per-list caps are dropped with a warning (silently
+   under-delivering would be worse). */
 static void
-geyser_parse_accounts_filter( uchar const *  v,
-                              ulong          v_sz,
-                              geyser_sub_t * sub ) {
+geyser_parse_accounts_filter( uchar const *          v,
+                              ulong                  v_sz,
+                              geyser_acct_filter_t * f ) {
   ulong pos = 0UL;
   while( pos<v_sz ) {
     ulong tag;
@@ -234,15 +260,21 @@ geyser_parse_accounts_filter( uchar const *  v,
       ulong len;
       if( !geyser_pb_read_varint( v, v_sz, &pos, &len ) ) return;
       if( pos+len>v_sz ) return;
-      if( sub->acct_pubkey_cnt<GEYSER_SUB_ACCT_MAX &&
-          geyser_b58_pubkey( v+pos, len, sub->acct_pubkeys[ sub->acct_pubkey_cnt ] ) ) sub->acct_pubkey_cnt++;
+      if( f->pubkey_cnt<GEYSER_SUB_ACCT_MAX ) {
+        if( geyser_b58_pubkey( v+pos, len, f->pubkeys[ f->pubkey_cnt ] ) ) f->pubkey_cnt++;
+      } else {
+        FD_LOG_WARNING(( "geyser: accounts filter has more than %lu account keys; extra keys dropped", GEYSER_SUB_ACCT_MAX ));
+      }
       pos += len;
     } else if( field==3U && wt==2U ) { /* owner */
       ulong len;
       if( !geyser_pb_read_varint( v, v_sz, &pos, &len ) ) return;
       if( pos+len>v_sz ) return;
-      if( sub->owner_cnt<GEYSER_SUB_OWNER_MAX &&
-          geyser_b58_pubkey( v+pos, len, sub->owners[ sub->owner_cnt ] ) ) sub->owner_cnt++;
+      if( f->owner_cnt<GEYSER_SUB_OWNER_MAX ) {
+        if( geyser_b58_pubkey( v+pos, len, f->owners[ f->owner_cnt ] ) ) f->owner_cnt++;
+      } else {
+        FD_LOG_WARNING(( "geyser: accounts filter has more than %lu owner keys; extra keys dropped", GEYSER_SUB_OWNER_MAX ));
+      }
       pos += len;
     } else {
       if( !geyser_pb_skip( v, v_sz, &pos, wt ) ) return;
@@ -250,11 +282,18 @@ geyser_parse_accounts_filter( uchar const *  v,
   }
 }
 
-/* Parse an accounts map entry: field 1 = key, field 2 = filter value. */
+/* Parse an accounts map entry (field 1 = key, field 2 = filter value)
+   into the sub's next free filter slot. */
 static void
 geyser_parse_accounts_entry( uchar const *  entry,
                              ulong          entry_sz,
                              geyser_sub_t * sub ) {
+  if( FD_UNLIKELY( sub->acct_filter_cnt>=GEYSER_SUB_FILTER_MAX ) ) {
+    FD_LOG_WARNING(( "geyser: more than %lu accounts filters in subscription; extra filters dropped", GEYSER_SUB_FILTER_MAX ));
+    return;
+  }
+  geyser_acct_filter_t * f = &sub->acct_filters[ sub->acct_filter_cnt++ ];
+
   ulong pos = 0UL;
   while( pos<entry_sz ) {
     ulong tag;
@@ -265,17 +304,14 @@ geyser_parse_accounts_entry( uchar const *  entry,
       ulong len;
       if( !geyser_pb_read_varint( entry, entry_sz, &pos, &len ) ) return;
       if( pos+len>entry_sz ) return;
-      if( !sub->acct_filter_key_len ) {
-        ulong cpy = fd_ulong_min( len, GEYSER_FILTER_KEY_MAX-1UL );
-        fd_memcpy( sub->acct_filter_key, entry+pos, cpy );
-        sub->acct_filter_key_len = cpy;
-      }
+      f->key_len = fd_ulong_min( len, GEYSER_FILTER_KEY_MAX-1UL );
+      fd_memcpy( f->key, entry+pos, f->key_len );
       pos += len;
     } else if( field==2U && wt==2U ) { /* value */
       ulong len;
       if( !geyser_pb_read_varint( entry, entry_sz, &pos, &len ) ) return;
       if( pos+len>entry_sz ) return;
-      geyser_parse_accounts_filter( entry+pos, len, sub );
+      geyser_parse_accounts_filter( entry+pos, len, f );
       pos += len;
     } else {
       if( !geyser_pb_skip( entry, entry_sz, &pos, wt ) ) return;
@@ -283,8 +319,28 @@ geyser_parse_accounts_entry( uchar const *  entry,
   }
 }
 
+/* Parse a SubscribeRequestPing (field 1 = int32 id). */
+static void
+geyser_parse_ping( uchar const *  v,
+                   ulong          v_sz,
+                   geyser_sub_t * sub ) {
+  sub->ping_present = 1;
+  ulong pos = 0UL;
+  while( pos<v_sz ) {
+    ulong tag;
+    if( !geyser_pb_read_varint( v, v_sz, &pos, &tag ) ) return;
+    if( (uint)( tag>>3 )==1U && (uint)( tag & 7U )==0U ) {
+      ulong id;
+      if( !geyser_pb_read_varint( v, v_sz, &pos, &id ) ) return;
+      sub->ping_id = (int)(uint)id;
+    } else {
+      if( !geyser_pb_skip( v, v_sz, &pos, (uint)( tag & 7U ) ) ) return;
+    }
+  }
+}
+
 /* Parse a SubscribeRequest: field 1 = accounts map, field 2 = slots map,
-   field 6 = commitment.  Replaces (does not merge) the subscription. */
+   field 6 = commitment, field 9 = ping. */
 static void
 geyser_parse_subscribe_request( uchar const *  msg,
                                 ulong          msg_sz,
@@ -300,7 +356,6 @@ geyser_parse_subscribe_request( uchar const *  msg,
       ulong len;
       if( !geyser_pb_read_varint( msg, msg_sz, &pos, &len ) ) return;
       if( pos+len>msg_sz ) return;
-      sub->wants_accounts = 1;
       geyser_parse_accounts_entry( msg+pos, len, sub );
       pos += len;
     } else if( field==2U && wt==2U ) {       /* slots map entry */
@@ -314,6 +369,12 @@ geyser_parse_subscribe_request( uchar const *  msg,
       ulong c;
       if( !geyser_pb_read_varint( msg, msg_sz, &pos, &c ) ) return;
       sub->commitment = (uint)c;
+    } else if( field==9U && wt==2U ) {       /* ping */
+      ulong len;
+      if( !geyser_pb_read_varint( msg, msg_sz, &pos, &len ) ) return;
+      if( pos+len>msg_sz ) return;
+      geyser_parse_ping( msg+pos, len, sub );
+      pos += len;
     } else {
       if( !geyser_pb_skip( msg, msg_sz, &pos, wt ) ) return;
     }
@@ -329,16 +390,19 @@ geyser_encode_account_update( uchar *              out,
                               uchar const *        data,
                               ulong                data_len,
                               ulong                write_version,
-                              char const *         filter_key,
-                              ulong                filter_key_len ) {
+                              geyser_acct_filter_t const * const * matched,
+                              ulong                matched_cnt ) {
   fd_pb_encoder_t enc[1];
   fd_pb_encoder_init( enc, out, out_sz );
 
   /* Bail (return 0 -> caller skips) rather than risk an unbalanced
      submessage close crashing the tile if the buffer is ever too small. */
 
-  /* SubscribeUpdate.filters = 1 (repeated string) */
-  if( filter_key_len ) fd_pb_push_string( enc, 1U, filter_key, filter_key_len );
+  /* SubscribeUpdate.filters = 1 (repeated string): every filter entry
+     that matched this account. */
+  for( ulong i=0UL; i<matched_cnt; i++ ) {
+    if( matched[ i ]->key_len ) fd_pb_push_string( enc, 1U, matched[ i ]->key, matched[ i ]->key_len );
+  }
 
   /* SubscribeUpdate.account = 2 (SubscribeUpdateAccount) */
   if( FD_UNLIKELY( !fd_pb_submsg_open( enc, 2U ) ) ) return 0;
@@ -359,17 +423,28 @@ geyser_encode_account_update( uchar *              out,
   return fd_pb_encoder_out_sz( enc );
 }
 
+/* geyser_filter_match implements Yellowstone per-entry semantics: a
+   non-empty account list AND a non-empty owner list must both match; an
+   empty list is a wildcard (an entry with both empty matches all). */
 static int
-geyser_acct_match( geyser_sub_t const * sub,
-                   uchar const *        pubkey,
-                   uchar const *        owner ) {
-  if( !sub->wants_accounts ) return 0;
-  if( sub->acct_pubkey_cnt==0UL && sub->owner_cnt==0UL ) return 1; /* match all */
-  for( ulong i=0UL; i<sub->acct_pubkey_cnt; i++ )
-    if( fd_memeq( pubkey, sub->acct_pubkeys[ i ], 32UL ) ) return 1;
-  for( ulong i=0UL; i<sub->owner_cnt; i++ )
-    if( fd_memeq( owner, sub->owners[ i ], 32UL ) ) return 1;
-  return 0;
+geyser_filter_match( geyser_acct_filter_t const * f,
+                     uchar const *                pubkey,
+                     uchar const *                owner ) {
+  if( f->pubkey_cnt ) {
+    int hit = 0;
+    for( ulong i=0UL; i<f->pubkey_cnt; i++ ) {
+      if( fd_memeq( pubkey, f->pubkeys[ i ], 32UL ) ) { hit = 1; break; }
+    }
+    if( !hit ) return 0;
+  }
+  if( f->owner_cnt ) {
+    int hit = 0;
+    for( ulong i=0UL; i<f->owner_cnt; i++ ) {
+      if( fd_memeq( owner, f->owners[ i ], 32UL ) ) { hit = 1; break; }
+    }
+    if( !hit ) return 0;
+  }
+  return 1;
 }
 
 static void
@@ -380,12 +455,21 @@ geyser_publish_account( fd_geyser_tile_t *           ctx,
   ulong write_version = ctx->write_version++;
   for( ulong conn_id=0UL; conn_id<ctx->max_conn_cnt; conn_id++ ) {
     geyser_sub_t * sub = &ctx->subs[ conn_id ];
-    if( !geyser_acct_match( sub, h->pubkey, h->owner ) ) continue;
+    if( !sub->acct_filter_cnt ) continue;
     if( !fd_grpc_server_has_stream( ctx->server, conn_id ) ) continue;
+
+    geyser_acct_filter_t const * matched[ GEYSER_SUB_FILTER_MAX ];
+    ulong matched_cnt = 0UL;
+    for( ulong i=0UL; i<sub->acct_filter_cnt; i++ ) {
+      if( geyser_filter_match( &sub->acct_filters[ i ], h->pubkey, h->owner ) ) {
+        matched[ matched_cnt++ ] = &sub->acct_filters[ i ];
+      }
+    }
+    if( !matched_cnt ) continue;
 
     ulong sz = geyser_encode_account_update( ctx->acct_enc_buf, GEYSER_ACCT_ENC_BUF_SZ,
                                              h, data, data_len, write_version,
-                                             sub->acct_filter_key, sub->acct_filter_key_len );
+                                             matched, matched_cnt );
     if( FD_UNLIKELY( !sz ) ) continue; /* encode failed; skip this update */
     if( FD_UNLIKELY( !fd_grpc_server_publish( ctx->server, conn_id, ctx->acct_enc_buf, sz ) ) ) {
       fd_grpc_server_close( ctx->server, conn_id );
@@ -440,6 +524,19 @@ geyser_publish_slot( fd_geyser_tile_t * ctx,
   }
 }
 
+/* Encode and send a SubscribeUpdate.pong (field 9, { int32 id = 1 }). */
+static void
+geyser_publish_pong( fd_geyser_tile_t * ctx,
+                     ulong              conn_id,
+                     int                ping_id ) {
+  fd_pb_encoder_t enc[1];
+  fd_pb_encoder_init( enc, ctx->enc_buf, sizeof(ctx->enc_buf) );
+  if( FD_UNLIKELY( !fd_pb_submsg_open( enc, 9U ) ) ) return;
+  fd_pb_push_int32( enc, 1U, ping_id );
+  if( FD_UNLIKELY( !fd_pb_submsg_close( enc ) ) ) return;
+  fd_grpc_server_publish( ctx->server, conn_id, ctx->enc_buf, fd_pb_encoder_out_sz( enc ) );
+}
+
 /* fd_grpc_server upcalls. ---------------------------------------------*/
 
 static void
@@ -452,10 +549,20 @@ geyser_cb_request_msg( void *        _ctx,
   (void)path; (void)path_len;
   fd_geyser_tile_t * ctx = _ctx;
   if( FD_UNLIKELY( conn_id>=ctx->max_conn_cnt ) ) return;
-  geyser_sub_t * sub = &ctx->subs[ conn_id ];
-  /* A SubscribeRequest replaces the subscription. */
-  fd_memset( sub, 0, sizeof(geyser_sub_t) );
-  geyser_parse_subscribe_request( msg, msg_sz, sub );
+
+  geyser_sub_t tmp[1];
+  fd_memset( tmp, 0, sizeof(geyser_sub_t) );
+  geyser_parse_subscribe_request( msg, msg_sz, tmp );
+
+  /* A ping-only request solicits a Pong and must NOT replace the
+     subscription (Yellowstone keepalive semantics). */
+  if( tmp->ping_present ) {
+    geyser_publish_pong( ctx, conn_id, tmp->ping_id );
+    return;
+  }
+
+  /* Otherwise the request replaces the subscription. */
+  ctx->subs[ conn_id ] = *tmp; /* struct copy */
 }
 
 static void
@@ -505,6 +612,10 @@ returnable_frag( fd_geyser_tile_t *  ctx,
                  fd_stem_context_t * stem ) {
   (void)stem;
 
+  if( FD_UNLIKELY( chunk<ctx->in[ in_idx ].chunk0 || chunk>ctx->in[ in_idx ].wmark || sz>ctx->in[ in_idx ].mtu ) ) {
+    FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
+  }
+
   if( ctx->in_kind[ in_idx ]==IN_KIND_ACCT ) {
     ulong          hdr_sz = sizeof(fd_geyser_acct_hdr_t);
     uchar const *  frag   = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
@@ -530,8 +641,17 @@ returnable_frag( fd_geyser_tile_t *  ctx,
     }
 
     if( eom && r->active ) {
-      /* Discard accounts left incomplete by an overrun (dropped fragment). */
-      if( FD_LIKELY( r->data_off==r->hdr.data_len ) ) geyser_publish_account( ctx, &r->hdr, buf, r->data_off );
+      if( FD_UNLIKELY( r->hdr.flags & FD_GEYSER_ACCT_FLAG_TRUNCATED ) ) {
+        /* The producer capped the data; streaming a partial account as if
+           complete would corrupt the consumer's view.  Drop it. */
+        FD_BASE58_ENCODE_32_BYTES( r->hdr.pubkey, pubkey_b58 );
+        FD_LOG_WARNING(( "geyser: dropping oversized account update for %s (data > %lu bytes)",
+                         pubkey_b58, FD_GEYSER_ACCT_DATA_MAX ));
+      } else if( FD_LIKELY( r->data_off==r->hdr.data_len ) ) {
+        /* Publish only if complete (an overrun-dropped fragment leaves
+           data_off short of data_len). */
+        geyser_publish_account( ctx, &r->hdr, buf, r->data_off );
+      }
       r->active = 0;
     }
     return 0;
@@ -643,8 +763,9 @@ unprivileged_init( fd_topo_t const *      topo,
   }
 
   ulong scratch_top = FD_SCRATCH_ALLOC_FINI( l, scratch_align() );
-  if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) )
+  if( FD_UNLIKELY( scratch_top > (ulong)scratch + scratch_footprint( tile ) ) ) {
     FD_LOG_ERR(( "scratch overflow" ));
+  }
 }
 
 static ulong
@@ -675,8 +796,9 @@ populate_allowed_fds( fd_topo_t const *      topo,
 
   ulong out_cnt = 0UL;
   out_fds[ out_cnt++ ] = 2; /* stderr */
-  if( FD_LIKELY( -1!=fd_log_private_logfile_fd() ) )
+  if( FD_LIKELY( -1!=fd_log_private_logfile_fd() ) ) {
     out_fds[ out_cnt++ ] = fd_log_private_logfile_fd();
+  }
   out_fds[ out_cnt++ ] = fd_grpc_server_listen_fd( ctx->server );
   return out_cnt;
 }
