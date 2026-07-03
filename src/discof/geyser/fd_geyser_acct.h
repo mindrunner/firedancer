@@ -13,11 +13,11 @@
    fragment with both SOM and EOM set.  The geyser tile reassembles per
    in-link.
 
-   Account data is capped at FD_GEYSER_ACCT_DATA_MAX; data beyond that is
-   truncated and the TRUNCATED flag is set (rare -- only the largest
-   program/PDA accounts exceed it, and they seldom change).  The cap
-   bounds the geyser tile's per-link reassembly buffers and per-conn
-   outbound rings.
+   FD_GEYSER_ACCT_DATA_MAX equals the runtime's maximum account size, so
+   every account streams in full -- no update is ever truncated.  (The
+   TRUNCATED flag machinery is kept as a defensive invariant check.)
+   The cap sizes the geyser tile's per-link reassembly buffers and
+   per-conn outbound rings.
 
    The links are wired UNRELIABLE so a slow or dead geyser consumer can
    never backpressure the consensus-critical execution tiles. */
@@ -25,15 +25,15 @@
 #include "../../disco/stem/fd_stem.h"
 #include "../../disco/fd_disco_base.h"
 #include "../../tango/fd_tango_base.h"
+#include "../../flamenco/runtime/fd_runtime_const.h"
 
 #define FD_GEYSER_ACCT_FLAG_HAS_SIG    (1U)
 #define FD_GEYSER_ACCT_FLAG_TRUNCATED  (2U)
 
-/* Max account data streamed in full (fragments reassembled).  1 MiB
-   covers essentially all accounts that change in a transaction; larger
-   accounts are truncated.  Bump (with the matching memory cost in the
-   geyser tile) to raise the ceiling toward FD_RUNTIME_ACC_SZ_MAX. */
-#define FD_GEYSER_ACCT_DATA_MAX (1UL<<20)
+/* Max account data streamed in full (fragments reassembled).  Equal to
+   the runtime's max account size (10 MiB), so this bound can never be
+   exceeded and no account update is dropped for size. */
+#define FD_GEYSER_ACCT_DATA_MAX FD_RUNTIME_ACC_SZ_MAX
 
 struct __attribute__((packed)) fd_geyser_acct_hdr {
   uchar pubkey[ 32 ];

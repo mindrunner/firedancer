@@ -182,7 +182,7 @@ execle_publish_geyser_accounts( fd_execle_tile_t *   ctx,
   if( FD_UNLIKELY( !to->err.is_committable ) ) return;
 
   /* Note on STEM_BURST: this can publish many fragments per stem
-     callback (several accounts, each up to ~17 fragments), but the
+     callback (several accounts, each up to ~161 fragments for a max-size account), but the
      geyser link has no reliable consumer, so fd_stem_publish does not
      consume flow control credits for it (see out_reliable in
      fd_stem.c) and the STEM_BURST contract is unaffected. */
