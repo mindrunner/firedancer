@@ -535,6 +535,7 @@ lockout_check( fd_tower_t * tower,
 static int
 is_purged( fd_tower_t * tower,
            fd_ghost_blk_t * blk ) {
+  if( FD_UNLIKELY( blk->slot < tower->root ) ) return 1; /* pruned from tower blocks by reconcile, ghost not yet published */
   fd_tower_blk_t * tower_blk = fd_tower_blocks_query( tower, blk->slot );
   return tower_blk->confirmed && memcmp( &tower_blk->confirmed_block_id, &blk->id, sizeof(fd_hash_t) );
 }
@@ -588,6 +589,7 @@ switch_check( fd_tower_t * tower,
     if( FD_UNLIKELY( !is_valid_leaf ) ) continue;  /* not a real candidate */
 
     ulong candidate_slot = blk->slot;
+    if( FD_UNLIKELY( candidate_slot < root_slot ) ) continue;
     ulong lca = fd_tower_blocks_lowest_common_ancestor( tower, candidate_slot, vote_slot );
     if( FD_UNLIKELY( candidate_slot == vote_slot ) ) continue;
     if( FD_UNLIKELY( lca==ULONG_MAX ) ) continue;       /* unlikely but this leaf is an already pruned minority fork */
