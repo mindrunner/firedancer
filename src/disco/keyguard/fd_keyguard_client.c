@@ -104,6 +104,13 @@ fd_keyguard_client_sign( fd_keyguard_client_t * client,
 }
 
 void
+fd_keyguard_client_tls_cv_sign( void *      signer_ctx,
+                                uchar       signature[ static 64 ],
+                                uchar const payload[ static 130 ] ) {
+  fd_keyguard_client_sign( signer_ctx, signature, payload, 130UL, FD_KEYGUARD_SIGN_TYPE_ED25519 );
+}
+
+void
 fd_keyguard_client_vote_txn_sign( fd_keyguard_client_t * client,
                                   uchar *                signatures,
                                   ulong                  authority_idx,

@@ -15,6 +15,7 @@
 #include "../../discof/backup/fd_snapsv_tile.h"
 #include "../../disco/shred/fd_shred_tile.h"
 #include "../../disco/store/fd_store.h"
+#include "../../disco/keyguard/fd_keyguard.h"
 #include "../../discof/repair/fd_repair_tile.h"
 #include "../../disco/net/fd_net_tile.h"
 #include "../../discof/backup/fd_backup.h"

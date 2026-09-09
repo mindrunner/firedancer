@@ -25,6 +25,15 @@ ag_votor_advance_epoch( ag_votor_t * self,
                         ulong        epoch_rank,
                         ulong        epoch_slot );
 
+/* Switches the local validator identity without advancing an epoch.
+   Pending local votes and identity-specific per-slot decisions are
+   discarded. */
+
+void
+ag_votor_set_identity( ag_votor_t * self,
+                       ulong        curr_epoch_rank,
+                       ulong        next_epoch_rank );
+
 /* ag_votor_set_bls_signer installs the BLS signer used for our own
    votes.  The votor never holds the BLS secret key itself; in the
    validator sign_fn forwards the signing payload to the sign tile. */

@@ -1303,6 +1303,23 @@ test_add_block_below_watermark( void ) {
   teardown_pool( pool );
 }
 
+static void
+test_set_identity_updates_own_rank( void ) {
+  ag_pool_t * pool = setup_pool();
+
+  ag_slot_state_t * existing = slot_state( pool, 1UL );
+  FD_TEST( existing->own_rank==0UL );
+
+  ag_pool_set_identity( pool, 3UL, USHORT_MAX );
+
+  FD_TEST( pool->curr_epoch_rank==3UL );
+  FD_TEST( pool->next_epoch_rank==USHORT_MAX );
+  FD_TEST( existing->own_rank==3UL );
+  FD_TEST( slot_state( pool, 2UL )->own_rank==3UL );
+
+  teardown_pool( pool );
+}
+
 int
 main( int     argc,
       char ** argv ) {
@@ -1344,6 +1361,7 @@ main( int     argc,
   test_retired_epoch_already_pruned();
   test_standstill_recovery_no_final_cert();
   test_add_block_below_watermark();
+  test_set_identity_updates_own_rank();
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();
